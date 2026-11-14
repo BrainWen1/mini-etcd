@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"log"
+	"mini-etcd/internal/apply"
 	"mini-etcd/internal/config"
 	"mini-etcd/internal/server"
+	"mini-etcd/internal/storage"
 	"mini-etcd/internal/transport"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 )
 
 func main() {
@@ -19,16 +25,43 @@ func main() {
 
 	// 启动 3 个节点
 	for _, id := range peerIDs {
+		// 创建节点默认配置
 		cfg := config.Default(id, peerIDs)
 
-		// 给节点创建专属网卡，并接入全局网络
+		// 初始化各个组件
+		storage := storage.NewMemoryStorage()
 		trans := transport.NewMemoryTransport(id, network)
+		applier := apply.NewApplier()
 
 		// 组装 Server
-		srv := server.NewServer(cfg, trans)
+		srv := server.NewServer(cfg, storage, trans, applier)
 		servers = append(servers, srv)
-
 		go srv.Start()
+	}
+
+	// 等待一段时间让节点启动并选出 Leader
+	time.Sleep(2 * time.Second)
+
+	// 向所有节点尝试 Propose
+	log.Println(">>> 准备发起写请求：PUT name mini-etcd")
+	for _, srv := range servers {
+		entry := fmt.Appendf([]byte{}, "PUT name mini-etcd%d", srv.Cfg.ID)
+
+		err := srv.Rn.Propose(context.Background(), entry) // 通过 RaftNode 发起提议
+		if err != nil {
+			log.Printf("节点 %d 提议失败: %v\n", srv.Cfg.ID, err)
+		} else {
+			log.Printf("节点 %d 提议成功\n", srv.Cfg.ID)
+		}
+	}
+
+	// 等待日志复制并应用
+	time.Sleep(2 * time.Second)
+
+	// 模拟查询
+	for _, srv := range servers {
+		val, ok := srv.Applier.Get("name")
+		log.Printf("读取数据: name = %s, 存在=%v\n", val, ok)
 	}
 
 	// 优雅退出
