@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 	"time"
+
+	"go.etcd.io/etcd/raft/v3"
 )
 
 // Run 启动核心循环
@@ -26,7 +28,10 @@ func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { /
 			}
 		case rd := <-rn.Node.Ready(): // Raft 节点有 Ready 状态，处理 Ready
 			// 1. 持久化
-			rn.storage.SaveHardState(rd.HardState)
+			if !raft.IsEmptyHardState(rd.HardState) { // Ready 的 HardState 经常是空的，只有在节点状态发生变化时才会有值
+				rn.storage.SaveHardState(rd.HardState)
+			}
+
 			rn.storage.SaveEntries(rd.Entries)
 
 			// 2. 发送消息
