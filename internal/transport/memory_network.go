@@ -33,11 +33,9 @@ func (n *MemoryNetwork) Unregister(id uint64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	// 关闭收件箱并从全局 Map 中删除
-	if ch, ok := n.inboxes[id]; ok {
-		close(ch)
-		delete(n.inboxes, id)
-	}
+	// 从全局 Map 中删除节点的收件箱
+	// 不关闭通道，因为可能还有其他 goroutine 正在向该通道发送消息。
+	delete(n.inboxes, id)
 }
 
 // Route 路由消息：把消息投递给目标节点
@@ -46,8 +44,13 @@ func (n *MemoryNetwork) Route(msgs []raftpb.Message) {
 	defer n.mu.RUnlock()
 	for _, m := range msgs {
 		if ch, ok := n.inboxes[m.To]; ok {
-			// 为了防止死锁，最好异步发送。或者因为带缓冲，直接塞也可以。
-			ch <- m
+			// 使用 select 语句尝试发送消息到通道，如果通道已满，则丢弃消息以避免阻塞
+			select {
+			case ch <- m:
+			default:
+				// 如果通道已满，丢弃消息以避免阻塞
+				// 可以在这里添加日志记录或其他处理逻辑
+			}
 		}
 	}
 }
