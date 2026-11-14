@@ -44,8 +44,9 @@ func main() {
 
 	// 向所有节点尝试 Propose
 	log.Println(">>> 准备发起写请求：PUT name mini-etcd")
+	requestID := fmt.Sprintf("%d", time.Now().UnixNano()) // 用唯一的请求 ID 来标识这次请求，模拟重复请求
 	for _, srv := range servers {
-		entry := fmt.Appendf([]byte{}, "PUT name mini-etcd%d", srv.Cfg.ID)
+		entry := fmt.Appendf([]byte{}, "%s PUT name mini-etcd%d", requestID, srv.Cfg.ID)
 
 		err := srv.Rn.Propose(context.Background(), entry) // 通过 RaftNode 发起提议
 		if err != nil {

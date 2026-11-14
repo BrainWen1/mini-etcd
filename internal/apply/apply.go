@@ -10,12 +10,16 @@ import (
 
 // Applier 定义了应用已提交日志条目的接口
 type Applier struct {
-	mu   sync.RWMutex      // 保护并发访问
-	data map[string]string // 存储状态机的数据
+	mu         sync.RWMutex        // 保护并发访问
+	data       map[string]string   // 存储状态机的数据
+	appliedIDs map[string]struct{} // 记录已应用的日志条目 ID，做幂等处理
 }
 
 func NewApplier() *Applier {
-	return &Applier{data: make(map[string]string)}
+	return &Applier{
+		data:       make(map[string]string),
+		appliedIDs: make(map[string]struct{}),
+	}
 }
 
 // Apply 应用已提交的日志条目到状态机
@@ -31,10 +35,22 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 		log.Printf("[apply] 日志索引: %d, 命令: %s\n", entry.Index, cmd)
 		parts := strings.Split(cmd, " ")
 
-		if len(parts) == 3 {
-			switch parts[0] {
+		if len(parts) == 4 {
+			requestID := parts[0]
+			// 检查是否已经应用过该请求，避免重复应用
+			a.mu.RLock()
+			if _, exists := a.appliedIDs[requestID]; exists {
+				a.mu.RUnlock()
+				log.Printf("[apply] 拦截到重复请求: %s\n", requestID)
+				continue
+			}
+			// 到这说明是第一次应用该请求，记录下来
+			a.appliedIDs[requestID] = struct{}{}
+			a.mu.RUnlock()
+
+			switch parts[1] {
 			case "PUT": // 处理 PUT 命令
-				key, val := parts[1], parts[2]
+				key, val := parts[2], parts[3]
 				a.mu.Lock()
 				a.data[key] = val
 				a.mu.Unlock()
