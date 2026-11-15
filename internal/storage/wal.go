@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -54,7 +55,8 @@ func OpenWAL(walPath string, snapPath string) (*WAL, error) {
 	}
 	if snap != nil {
 		if err := w.MemoryStorage.ApplySnapshot(*snap); err != nil {
-			log.Printf("Warning: failed to apply snapshot file: %v. Ignoring.", err)
+			file.Close() // 关闭文件流
+			return nil, fmt.Errorf("failed to apply snapshot to memory storage: %w", err)
 		}
 	}
 
@@ -72,11 +74,61 @@ func OpenWAL(walPath string, snapPath string) (*WAL, error) {
 			return nil, fmt.Errorf("failed to append entries to memory storage: %w", err)
 		}
 	}
+	var hs raftpb.HardState
 	if len(hardStates) > 0 {
-		// 将最新的 HardState 设置到内存存储中
-		if err := w.MemoryStorage.SetHardState(hardStates[len(hardStates)-1]); err != nil { // 只需要取最后一个 HardState，即最新状态
-			file.Close() // 关闭文件流
-			return nil, fmt.Errorf("failed to set hard state in memory storage: %w", err)
+		// 如果有 HardState，取最后一条作为最新的 HardState
+		hs = hardStates[len(hardStates)-1]
+	} else if snap != nil {
+		// 走到这里说明：磁盘上有快照，但 wal.log 里一条记录都没有（HardState 自然也读不到）。
+		// 真实场景有两种：
+		//   1. Bootstrap 时刚写完初始快照（index=1），进程还没来得及处理任何 Ready 就挂了；
+		//   2. 快照文件是从别处拷贝/恢复过来的，而 WAL 是新建的空文件。
+		// 此时如果什么都不做，hs 就是零值，raft 会以 Term=0 启动 —— 而磁盘上的快照明明
+		// 已经证明「Term 到过 snap.Term、index 到过 snap.Index」。用 0 起步会让节点
+		// 在旧任期里重新选举，属于安全性瑕疵。
+		// 快照本身就是这两项的持久化证据，所以直接以快照为准合成 HardState。
+		// Vote 留空（raft.None）：本地没有任何投票记录，且合成出来的 Term 下也不该凭空有票。
+		hs = raftpb.HardState{
+			Term:   snap.Metadata.Term,
+			Commit: snap.Metadata.Index,
+		}
+	}
+	// 修复「快照比 HardState 新」的崩溃窗口：
+	// Ready 的处理顺序是「先落盘快照，再落盘 HardState」，如果进程在两者之间挂掉，
+	// 磁盘上就会出现「快照 index=100，但 WAL 里 HardState.Commit 还停留在 33」的状态。
+	// 直接 SetHardState 会让 raft.loadState 直接 panic：
+	//   panic: 1 state.commit 33 is out of range [100, 100]
+	// 快照本身就是「index 100 已提交」的证据，所以以快照为准把 Commit 补齐；
+	// Term 落后时一并抬到快照的 Term，此时旧的 Vote 属于旧 Term，必须清空。
+	if snap != nil && hs.Commit < snap.Metadata.Index {
+		log.Printf("Warning: hard state commit %d is behind snapshot index %d, repairing from snapshot", hs.Commit, snap.Metadata.Index)
+		hs.Commit = snap.Metadata.Index // 以快照为准把 Commit 补齐
+		if hs.Term < snap.Metadata.Term {
+			hs.Term = snap.Metadata.Term // Term 落后时一并抬到快照的 Term
+			hs.Vote = raft.None          // 旧的 Vote 属于旧 Term，必须清空
+		}
+	}
+
+	// 将最新的 HardState 设置到内存存储中
+	if err := w.MemoryStorage.SetHardState(hs); err != nil {
+		file.Close() // 关闭文件流
+		return nil, fmt.Errorf("failed to set hard state in memory storage: %w", err)
+	}
+
+	// 校检快照和 WAL 文件的一致性
+	// 注意：不能用 w.MemoryStorage.LastIndex() 来比较 —— ApplySnapshot 之后它至少等于快照索引，
+	// 快照索引 > LastIndex 恒不成立，这个校验永远不会触发。这里改用 WAL 文件里真实的最后一条日志索引。
+	if snap != nil {
+		var walLastIndex uint64
+		if n := len(entriesList); n > 0 {
+			if last := entriesList[n-1]; len(last) > 0 {
+				walLastIndex = last[len(last)-1].Index // WAL 最后一条日志的索引
+			}
+		}
+		// 快照索引大于 WAL 最后一条日志是合法的：follower 落后太多时，leader 直接发快照帮它追赶，
+		// 本地 WAL 里本来就不会有快照覆盖的那段日志，所以这里只提示，不当作错误。
+		if walLastIndex > 0 && snap.Metadata.Index > walLastIndex {
+			log.Printf("Warning: snapshot index %d is ahead of WAL last entry index %d (entries covered by the snapshot were never written to this WAL)", snap.Metadata.Index, walLastIndex)
 		}
 	}
 
@@ -277,6 +329,32 @@ func (w *WAL) SaveSnapshot(snapshot raftpb.Snapshot) error {
 	}
 	defer dirFile.Close()
 	dirFile.Sync()
+
+	// 清理旧快照文件，只保留最新的五个
+	files, err := os.ReadDir(w.snapDir) // 读取目录下所有文件
+	if err != nil {
+		return err
+	}
+
+	var snapFiles []os.DirEntry
+	for _, f := range files {
+		if strings.HasSuffix(f.Name(), ".snap") { // 只保留 .snap 文件
+			snapFiles = append(snapFiles, f)
+		}
+	}
+
+	if len(snapFiles) > 5 {
+		// 按文件名排序，文件名中包含 Term 和 Index，按字典序排序即可
+		sort.Slice(snapFiles, func(i, j int) bool {
+			return snapFiles[i].Name() < snapFiles[j].Name()
+		})
+		for _, f := range snapFiles[:len(snapFiles)-5] { // 删除最旧的快照文件
+			if err := os.Remove(filepath.Join(w.snapDir, f.Name())); err != nil {
+				// 删除失败不致命，打印警告即可
+				log.Printf("Warning: failed to remove old snapshot file %s: %v", f.Name(), err)
+			}
+		}
+	}
 
 	return nil
 }

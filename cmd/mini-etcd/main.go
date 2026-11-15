@@ -41,9 +41,20 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to open WAL for node %d: %v", id, err)
 		}
+		applier := apply.NewApplier() // 初始化状态机应用器
+
+		snap, err := storage.LoadSnapshot() // 从磁盘加载最新快照
+		if err != nil {
+			log.Fatalf("Failed to load snapshot: %v", err)
+		}
+		if snap != nil && len(snap.Data) > 0 {
+			log.Printf("[Node %d] 从磁盘加载快照，恢复状态机数据 (index=%d)", id, snap.Metadata.Index)
+			if err := applier.ApplySnapshot(*snap); err != nil { // 将快照应用到状态机
+				log.Fatalf("Failed to apply snapshot to applier: %v", err)
+			}
+		}
 
 		trans := transport.NewMemoryTransport(id, network)
-		applier := apply.NewApplier()
 
 		// 组装 Server
 		srv := server.NewServer(cfg, storage, trans, applier)

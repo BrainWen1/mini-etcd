@@ -1,7 +1,7 @@
 package apply
 
 import (
-	"errors"
+	"encoding/json"
 	"log"
 	"strings"
 	"sync"
@@ -72,8 +72,40 @@ func (a *Applier) Get(key string) (string, bool) {
 	return val, ok
 }
 
+// snapData 结构体用于序列化和反序列化状态机数据和已应用的请求 ID
+type snapData struct {
+	Data       map[string]string   `json:"data"`
+	AppliedIDs map[string]struct{} `json:"applied_ids"`
+}
+
 // ApplySnapshot 应用快照
 func (a *Applier) ApplySnapshot(snapshot raftpb.Snapshot) error {
-	// Implementation for applying snapshot
-	return errors.New("ApplySnapshot not implemented yet")
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// 将快照数据反序列化为状态机数据和已应用的请求 ID
+	var snap snapData
+	if err := json.Unmarshal(snapshot.Data, &snap); err != nil {
+		return err
+	}
+
+	a.data = snap.Data
+	a.appliedIDs = snap.AppliedIDs
+
+	log.Printf("[apply] 成功应用快照，恢复状态机数据 (index=%d)\n", snapshot.Metadata.Index)
+	return nil
+}
+
+// GetSnapshot 获取当前状态机的全量数据的字节流
+func (a *Applier) GetSnapshot() ([]byte, error) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	// 创建一个结构体来保存状态机数据和已应用的请求 ID，一次性序列化为 JSON 字节流
+	snap := snapData{
+		Data:       a.data,
+		AppliedIDs: a.appliedIDs,
+	}
+
+	return json.Marshal(snap)
 }
