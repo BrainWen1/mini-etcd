@@ -28,8 +28,20 @@ func main() {
 		// 创建节点默认配置
 		cfg := config.Default(id, peerIDs)
 
+		// 创建节点数据目录
+		if err := os.MkdirAll(cfg.WALPath, 0755); err != nil {
+			log.Fatalf("Failed to create WAL directory for node %d: %v", id, err)
+		}
+		if err := os.MkdirAll(cfg.SnapshotPath, 0755); err != nil {
+			log.Fatalf("Failed to create snapshot directory for node %d: %v", id, err)
+		}
+
 		// 初始化各个组件
-		storage := storage.NewMemoryStorage()
+		storage, err := storage.OpenWAL(cfg.WALPath, cfg.SnapshotPath) // 使用 WAL 作为持久化存储
+		if err != nil {
+			log.Fatalf("Failed to open WAL for node %d: %v", id, err)
+		}
+
 		trans := transport.NewMemoryTransport(id, network)
 		applier := apply.NewApplier()
 
@@ -46,9 +58,11 @@ func main() {
 	log.Println(">>> 准备发起写请求：PUT name mini-etcd")
 	requestID := fmt.Sprintf("%d", time.Now().UnixNano()) // 用唯一的请求 ID 来标识这次请求，模拟重复请求
 	for _, srv := range servers {
-		entry := fmt.Appendf([]byte{}, "%s PUT name mini-etcd%d", requestID, srv.Cfg.ID)
+		entry := fmt.Appendf([]byte{}, "%s PUT name mini-etcd", requestID)
 
-		err := srv.Rn.Propose(context.Background(), entry) // 通过 RaftNode 发起提议
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // 设置超时时间，防止阻塞
+		defer cancel()
+		err := srv.Rn.Propose(ctx, entry) // 通过 RaftNode 发起提议
 		if err != nil {
 			log.Printf("节点 %d 提议失败: %v\n", srv.Cfg.ID, err)
 		} else {

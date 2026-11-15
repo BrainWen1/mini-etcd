@@ -1,6 +1,7 @@
 package apply
 
 import (
+	"errors"
 	"log"
 	"strings"
 	"sync"
@@ -38,15 +39,15 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 		if len(parts) == 4 {
 			requestID := parts[0]
 			// 检查是否已经应用过该请求，避免重复应用
-			a.mu.RLock()
+			a.mu.Lock()
 			if _, exists := a.appliedIDs[requestID]; exists {
-				a.mu.RUnlock()
+				a.mu.Unlock()
 				log.Printf("[apply] 拦截到重复请求: %s\n", requestID)
 				continue
 			}
 			// 到这说明是第一次应用该请求，记录下来
 			a.appliedIDs[requestID] = struct{}{}
-			a.mu.RUnlock()
+			a.mu.Unlock()
 
 			switch parts[1] {
 			case "PUT": // 处理 PUT 命令
@@ -74,5 +75,5 @@ func (a *Applier) Get(key string) (string, bool) {
 // ApplySnapshot 应用快照
 func (a *Applier) ApplySnapshot(snapshot raftpb.Snapshot) error {
 	// Implementation for applying snapshot
-	return nil
+	return errors.New("ApplySnapshot not implemented yet")
 }

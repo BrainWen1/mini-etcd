@@ -27,25 +27,41 @@ func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { /
 				log.Printf("Error stepping raft node: %v", err)
 			}
 		case rd := <-rn.Node.Ready(): // Raft 节点有 Ready 状态，处理 Ready
-			// 1. 持久化
-			if !raft.IsEmptyHardState(rd.HardState) { // Ready 的 HardState 经常是空的，只有在节点状态发生变化时才会有值
-				rn.storage.SaveHardState(rd.HardState)
+			// 1. 优先保存快照
+			if !raft.IsEmptySnap(rd.Snapshot) {
+				// 存到独立的 .snap 文件
+				if err := rn.storage.SaveSnapshot(rd.Snapshot); err != nil {
+					log.Fatalf("save snapshot failed: %v", err)
+				}
+				// // 让状态机（MVCC）从快照恢复数据
+				if err := rn.applier.ApplySnapshot(rd.Snapshot); err != nil {
+					log.Printf("Error applying snapshot: %v", err)
+				}
 			}
 
-			rn.storage.SaveEntries(rd.Entries)
+			// 2. 持久化
+			err := rn.storage.Save(rd.HardState, rd.Entries)
+			if err != nil {
+				// WAL 持久化失败是致命错误，直接退出
+				rn.storage.Close() // 先关闭 WAL 文件，释放资源
+				log.Fatalf("save hard state and entries failed: %v", err)
+			}
 
-			// 2. 发送消息
+			// 3. 发送消息
 			rn.trans.Send(rd.Messages)
 
-			// 3. 应用
+			// 4. 应用
 			if len(rd.CommittedEntries) > 0 {
 				err := rn.applier.Apply(rd.CommittedEntries)
 				if err != nil {
 					log.Printf("Error applying committed entries: %v", err)
 				}
+
+				// 判断是否需要触发快照
+				// to do later
 			}
 
-			// 4. 推进
+			// 5. 推进
 			rn.Node.Advance()
 		}
 	}

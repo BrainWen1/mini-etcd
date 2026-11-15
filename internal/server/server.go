@@ -15,13 +15,13 @@ type Server struct {
 
 	trans   *transport.MemoryTransport
 	Applier *apply.Applier
-	storage *storage.MemoryStorage
+	storage *storage.WAL
 
 	stopc chan struct{}
 }
 
 // NewServer 创建一个新的 Server 实例
-func NewServer(cfg config.Config, storage *storage.MemoryStorage, trans *transport.MemoryTransport, applier *apply.Applier) *Server {
+func NewServer(cfg config.Config, storage *storage.WAL, trans *transport.MemoryTransport, applier *apply.Applier) *Server {
 	// 创建 RaftNode 实例
 	rn := raftnode.NewRaftNode(cfg, storage, trans, applier)
 
