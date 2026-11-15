@@ -25,11 +25,10 @@ type WALRecord struct {
 }
 
 type WAL struct {
-	*raft.MemoryStorage              // 因为 Raft 算法需要高频调用 Entries() 和 Term()，每次查磁盘会卡死，所以要用内存存储来缓存
-	mu                  sync.Mutex   // 保护并发写入
-	file                *os.File     // WAL 文件句柄
-	enc                 *gob.Encoder // gob 编码器
-	snapDir             string       // 快照文件目录
+	*raft.MemoryStorage            // 因为 Raft 算法需要高频调用 Entries() 和 Term()，每次查磁盘会卡死，所以要用内存存储来缓存
+	mu                  sync.Mutex // 保护并发写入
+	file                *os.File   // WAL 文件句柄
+	snapDir             string     // 快照文件目录
 }
 
 // OpenWAL 打开 WAL 文件，如果文件不存在则创建一个新的文件，并返回一个 WAL 实例
@@ -43,7 +42,6 @@ func OpenWAL(walPath string, snapPath string) (*WAL, error) {
 	// 创建 WAL 实例
 	w := &WAL{
 		file:          file,
-		enc:           gob.NewEncoder(file),
 		MemoryStorage: raft.NewMemoryStorage(),
 		snapDir:       snapPath,
 	}
@@ -51,6 +49,7 @@ func OpenWAL(walPath string, snapPath string) (*WAL, error) {
 	// 先从独立 .snap 文件加载最新快照
 	snap, err := w.LoadSnapshot()
 	if err != nil {
+		file.Close() // 关闭文件流
 		return nil, err
 	}
 	if snap != nil {
@@ -60,7 +59,7 @@ func OpenWAL(walPath string, snapPath string) (*WAL, error) {
 	}
 
 	// 从文件恢复 HardState 和 Entries
-	hardStates, entriesList, err := w.ReadAll()
+	hardStates, entriesList, err := w.ReadAll() // ReadAll 会把文件指针移动到最后一条合法记录的末尾，后面就不用再 Seek 了
 	if err != nil {
 		file.Close() // 关闭文件流
 		return nil, err
@@ -69,17 +68,17 @@ func OpenWAL(walPath string, snapPath string) (*WAL, error) {
 	for _, entries := range entriesList {
 		// 将日志条目追加到内存存储中
 		if err := w.MemoryStorage.Append(entries); err != nil {
+			file.Close() // 关闭文件流
 			return nil, fmt.Errorf("failed to append entries to memory storage: %w", err)
 		}
 	}
 	if len(hardStates) > 0 {
 		// 将最新的 HardState 设置到内存存储中
 		if err := w.MemoryStorage.SetHardState(hardStates[len(hardStates)-1]); err != nil { // 只需要取最后一个 HardState，即最新状态
+			file.Close() // 关闭文件流
 			return nil, fmt.Errorf("failed to set hard state in memory storage: %w", err)
 		}
 	}
-
-	file.Seek(0, 2) // 将文件指针移动到文件末尾，准备追加写入
 
 	return w, nil
 }
@@ -208,7 +207,12 @@ func (w *WAL) ReadAll() ([]raftpb.HardState, [][]raftpb.Entry, error) {
 	}
 
 	// 4. 如果发现文件有坏尾巴（比如崩溃了），截断它
-	fileInfo, _ := w.file.Stat()
+	fileInfo, err := w.file.Stat()
+	if err != nil {
+		// 如果连文件信息都获取不到，说明文件可能被删除了，直接返回错误
+		log.Printf("Warning: failed to stat WAL file: %v. Returning error.", err)
+		return nil, nil, err
+	}
 	if fileInfo.Size() > lastValidOffset {
 		log.Printf("WAL file corrupted or incomplete. Truncating from %d to %d bytes.", fileInfo.Size(), lastValidOffset)
 		if err := w.file.Truncate(lastValidOffset); err != nil {
@@ -267,7 +271,10 @@ func (w *WAL) SaveSnapshot(snapshot raftpb.Snapshot) error {
 	}
 
 	// 同步目录，确保文件系统的元数据也落盘
-	dirFile, _ := os.Open(w.snapDir)
+	dirFile, err := os.Open(w.snapDir)
+	if err != nil {
+		return err
+	}
 	defer dirFile.Close()
 	dirFile.Sync()
 

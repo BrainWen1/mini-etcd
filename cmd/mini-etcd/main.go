@@ -61,8 +61,8 @@ func main() {
 		entry := fmt.Appendf([]byte{}, "%s PUT name mini-etcd", requestID)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // 设置超时时间，防止阻塞
-		defer cancel()
-		err := srv.Rn.Propose(ctx, entry) // 通过 RaftNode 发起提议
+		err := srv.Rn.Propose(ctx, entry)                                       // 通过 RaftNode 发起提议
+		cancel()                                                                // 释放资源
 		if err != nil {
 			log.Printf("节点 %d 提议失败: %v\n", srv.Cfg.ID, err)
 		} else {
