@@ -29,6 +29,7 @@ type Storage interface {
 // Applier 定义了应用已提交日志条目的接口
 type Applier interface {
 	Apply(entries []raftpb.Entry) error
+	GetConsistentIndex() (uint64, error)
 	ApplySnapshot(snapshot raftpb.Snapshot) error
 	GetSnapshot() ([]byte, error)
 }
@@ -65,6 +66,12 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 		log.Fatalf("Failed to get initial state: %v", err)
 	}
 
+	// 从 bbolt 存储中获取当前已应用的最高日志索引（appliedIndex），用于初始化 Raft 节点的 Applied 字段
+	appliedIndex, err := applier.GetConsistentIndex()
+	if err != nil {
+		log.Fatalf("Failed to get applied index: %v", err)
+	}
+
 	c := &raft.Config{
 		ID:              cfg.ID,
 		ElectionTick:    cfg.ElectionTick,
@@ -72,7 +79,7 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 		Storage:         storage,
 		MaxSizePerMsg:   1024 * 1024,
 		MaxInflightMsgs: 256,
-		// Applied:      lastIndex, // [注释掉] 纯内存状态机重启后数据为空，必须让 Raft 从 0 开始重放日志来重建数据
+		Applied:         appliedIndex,
 	}
 
 	var node raft.Node

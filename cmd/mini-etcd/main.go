@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log"
 	"mini-etcd/internal/apply"
+	"mini-etcd/internal/backend"
 	"mini-etcd/internal/config"
+	"mini-etcd/internal/mvcc"
 	"mini-etcd/internal/server"
 	"mini-etcd/internal/storage"
 	"mini-etcd/internal/transport"
@@ -35,19 +37,37 @@ func main() {
 		if err := os.MkdirAll(cfg.SnapshotPath, 0755); err != nil {
 			log.Fatalf("Failed to create snapshot directory for node %d: %v", id, err)
 		}
+		if err := os.MkdirAll(cfg.BackendPath, 0755); err != nil {
+			log.Fatalf("Failed to create backend directory for node %d: %v", id, err)
+		}
 
 		// 初始化各个组件
 		storage, err := storage.OpenWAL(cfg.WALPath, cfg.SnapshotPath) // 使用 WAL 作为持久化存储
 		if err != nil {
 			log.Fatalf("Failed to open WAL for node %d: %v", id, err)
 		}
-		applier := apply.NewApplier() // 初始化状态机应用器
+
+		be, err := backend.NewBackend(cfg.BackendPath)
+		if err != nil {
+			log.Fatalf("Failed to open backend for node %d: %v", id, err)
+		}
+		defer be.Close()
+		mvccStorage := mvcc.NewMVCC(be)
+
+		applier := apply.NewApplier(mvccStorage) // 初始化状态机应用器
 
 		snap, err := storage.LoadSnapshot() // 从磁盘加载最新快照
 		if err != nil {
 			log.Fatalf("Failed to load snapshot: %v", err)
 		}
-		if snap != nil && len(snap.Data) > 0 {
+		// bbolt 本身是持久化的，里面的数据可能比磁盘上的 Raft 快照更新
+		// （快照每 10 条日志才打一次）。如果无条件用旧快照覆盖状态机，
+		// 就会把快照之后已经落盘的写入回滚掉；只有快照比后端数据新时才需要恢复。
+		backendIndex, err := mvccStorage.GetConsistentIndex()
+		if err != nil {
+			log.Fatalf("Failed to get consistent index for node %d: %v", id, err)
+		}
+		if snap != nil && len(snap.Data) > 0 && snap.Metadata.Index > backendIndex {
 			log.Printf("[Node %d] 从磁盘加载快照，恢复状态机数据 (index=%d)", id, snap.Metadata.Index)
 			if err := applier.ApplySnapshot(*snap); err != nil { // 将快照应用到状态机
 				log.Fatalf("Failed to apply snapshot to applier: %v", err)

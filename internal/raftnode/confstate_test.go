@@ -77,6 +77,9 @@ func (nopApplier) ApplySnapshot(raftpb.Snapshot) error { return nil }
 // GetSnapshot 假装导出状态机数据，返回空数据。
 func (nopApplier) GetSnapshot() ([]byte, error) { return nil, nil }
 
+// GetConsistentIndex 假装返回已应用的最高日志索引，返回 0。
+func (nopApplier) GetConsistentIndex() (uint64, error) { return 0, nil }
+
 // TestConfStateFallback 验证：快照里没有 ConfState 时，NewRaftNode 会回退到 cfg.Peers。
 //
 // 测试步骤：

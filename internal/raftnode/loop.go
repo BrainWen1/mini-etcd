@@ -40,7 +40,7 @@ func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { /
 				}
 				// 让状态机（MVCC）从快照恢复数据
 				if err := rn.applier.ApplySnapshot(rd.Snapshot); err != nil {
-					log.Printf("Error applying snapshot: %v", err)
+					log.Fatalf("apply snapshot to state machine failed: %v", err)
 				}
 
 				// 更新 RaftNode 的 lastSnapshotIndex 和 confState 字段

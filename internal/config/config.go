@@ -14,6 +14,7 @@ type Config struct {
 
 	WALPath      string // WAL 文件路径
 	SnapshotPath string // 快照文件路径
+	BackendPath  string // 后端存储路径(bbolt 数据库文件路径)
 }
 
 func Default(id uint64, peers []uint64) Config {
@@ -25,5 +26,6 @@ func Default(id uint64, peers []uint64) Config {
 		HeartbeatTick: 1,
 		WALPath:       fmt.Sprintf("./data/wal/%d/", id),
 		SnapshotPath:  fmt.Sprintf("./data/snap/%d/", id),
+		BackendPath:   fmt.Sprintf("./data/backend/%d/", id),
 	}
 }

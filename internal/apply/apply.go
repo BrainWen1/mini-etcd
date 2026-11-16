@@ -1,25 +1,23 @@
 package apply
 
 import (
-	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
+	"mini-etcd/internal/mvcc"
 	"strings"
-	"sync"
 
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 // Applier 定义了应用已提交日志条目的接口
 type Applier struct {
-	mu         sync.RWMutex        // 保护并发访问
-	data       map[string]string   // 存储状态机的数据
-	appliedIDs map[string]struct{} // 记录已应用的日志条目 ID，做幂等处理
+	mvccStorage *mvcc.MVCC // 状态机的持久化存储
 }
 
-func NewApplier() *Applier {
+func NewApplier(mvccStorage *mvcc.MVCC) *Applier {
 	return &Applier{
-		data:       make(map[string]string),
-		appliedIDs: make(map[string]struct{}),
+		mvccStorage: mvccStorage,
 	}
 }
 
@@ -38,24 +36,15 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 
 		if len(parts) == 4 {
 			requestID := parts[0]
-			// 检查是否已经应用过该请求，避免重复应用
-			a.mu.Lock()
-			if _, exists := a.appliedIDs[requestID]; exists {
-				a.mu.Unlock()
-				log.Printf("[apply] 拦截到重复请求: %s\n", requestID)
-				continue
-			}
-			// 到这说明是第一次应用该请求，记录下来
-			a.appliedIDs[requestID] = struct{}{}
-			a.mu.Unlock()
 
 			switch parts[1] {
 			case "PUT": // 处理 PUT 命令
 				key, val := parts[2], parts[3]
-				a.mu.Lock()
-				a.data[key] = val
-				a.mu.Unlock()
-				log.Printf("[apply] 成功应用数据: %s -> %s\n", key, val)
+				// 写状态机失败不能吞掉：否则日志里显示「成功应用」，但数据实际没落盘
+				if err := a.mvccStorage.Put(key, val, entry.Index); err != nil {
+					return fmt.Errorf("apply PUT at index %d failed: %w", entry.Index, err)
+				}
+				log.Printf("[apply] 成功应用数据: %s -> %s, request ID: %s\n", key, val, requestID)
 			default:
 				log.Printf("[apply] 未知命令: %s\n", cmd)
 			}
@@ -64,48 +53,30 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 	return nil
 }
 
-// Get 获取状态机中的数据
-func (a *Applier) Get(key string) (string, bool) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	val, ok := a.data[key]
-	return val, ok
+// GetConsistentIndex 获取当前已应用的最高日志索引
+func (a *Applier) GetConsistentIndex() (uint64, error) {
+	return a.mvccStorage.GetConsistentIndex()
 }
 
-// snapData 结构体用于序列化和反序列化状态机数据和已应用的请求 ID
-type snapData struct {
-	Data       map[string]string   `json:"data"`
-	AppliedIDs map[string]struct{} `json:"applied_ids"`
-}
-
-// ApplySnapshot 应用快照
+// ApplySnapshot 应用快照到状态机
 func (a *Applier) ApplySnapshot(snapshot raftpb.Snapshot) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	// 将快照数据反序列化为状态机数据和已应用的请求 ID
-	var snap snapData
-	if err := json.Unmarshal(snapshot.Data, &snap); err != nil {
-		return err
-	}
-
-	a.data = snap.Data
-	a.appliedIDs = snap.AppliedIDs
-
-	log.Printf("[apply] 成功应用快照，恢复状态机数据 (index=%d)\n", snapshot.Metadata.Index)
-	return nil
+	return a.mvccStorage.ApplySnapshot(snapshot.Data)
 }
 
-// GetSnapshot 获取当前状态机的全量数据的字节流
+// GetSnapshot 获取状态机的快照数据
 func (a *Applier) GetSnapshot() ([]byte, error) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	return a.mvccStorage.GetSnapshot()
+}
 
-	// 创建一个结构体来保存状态机数据和已应用的请求 ID，一次性序列化为 JSON 字节流
-	snap := snapData{
-		Data:       a.data,
-		AppliedIDs: a.appliedIDs,
+// Get 获取状态机中指定 key 的值，第二个返回值表示 key 是否存在
+func (a *Applier) Get(key string) (string, bool) {
+	val, err := a.mvccStorage.Get(key)
+	if err != nil {
+		// key 不存在是正常情况，不当作错误打印
+		if !errors.Is(err, mvcc.ErrKeyNotFound) {
+			log.Printf("Error getting key %s: %v", key, err)
+		}
+		return "", false
 	}
-
-	return json.Marshal(snap)
+	return val, true
 }
