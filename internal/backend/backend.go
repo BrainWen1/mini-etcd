@@ -10,13 +10,21 @@ import (
 
 // Bucket 名称
 var (
-	MetaBucket = []byte("meta") // 存 appliedIndex, revision 等元数据
-	DataBucket = []byte("key")  // 存普通的 KV 数据
+	MetaBucket         = []byte("meta")          // 存 consistentIndex, revision 等元数据 ("RevisionKey" -> "67")
+	DataBucket         = []byte("data")          // 存带 revision 的 KV 数据 ("key_RevisionKey" -> "mini-etcd")
+	DataRevisionBucket = []byte("data_revision") // 存每个 key 的 revision ("key" -> "67")
 )
 
 const (
 	ConsistentIndexKey = "consistentIndex" // 存储一致性索引的键名
+	RevisionKey        = "revision"        // 存储全局 revision 的键名
 )
+
+// GetKeyWithRevision 生成带 revision 的 key，用于存储在 DataBucket 中
+func GetKeyWithRevision(key string, revision uint64) string {
+	// 使用不可见字符 \x00 作为分隔符，避免 key 和 revision 拼接后产生歧义
+	return fmt.Sprintf("%s\x00%d", key, revision)
+}
 
 // Backend 封装底层的 bbolt
 type Backend struct {
@@ -30,7 +38,7 @@ func NewBackend(path string) (*Backend, error) {
 		return nil, err
 	}
 
-	// 初始化：确保两个 Bucket 存在
+	// 初始化：确保三个 Bucket 存在
 	err = db.Update(func(tx *bbolt.Tx) error {
 		// 如果 Bucket 不存在就创建，存在就返回已存在的 Bucket
 		if _, err := tx.CreateBucketIfNotExists(MetaBucket); err != nil {
@@ -39,6 +47,10 @@ func NewBackend(path string) (*Backend, error) {
 		}
 		if _, err := tx.CreateBucketIfNotExists(DataBucket); err != nil {
 			log.Printf("Failed to create Data bucket: %v", err)
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists(DataRevisionBucket); err != nil {
+			log.Printf("Failed to create DataRevision bucket: %v", err)
 			return err
 		}
 		return nil
