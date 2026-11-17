@@ -2,10 +2,10 @@ package apply
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"mini-etcd/internal/mvcc"
 	"strings"
+	"sync"
 
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
@@ -13,12 +13,25 @@ import (
 // Applier 定义了应用已提交日志条目的接口
 type Applier struct {
 	mvccStorage *mvcc.MVCC // 状态机的持久化存储
+	waiters     sync.Map   // 用于等待日志应用完成的同步机制，key 是 requestID，value 是 chan error
 }
 
 func NewApplier(mvccStorage *mvcc.MVCC) *Applier {
 	return &Applier{
 		mvccStorage: mvccStorage,
 	}
+}
+
+// RegisterWaiter 注册等待者并返回 channel，供 Server 调用
+func (a *Applier) RegisterWaiter(requestID string) chan error {
+	ch := make(chan error, 1)
+	a.waiters.Store(requestID, ch)
+	return ch
+}
+
+// RemoveWaiter 清理超时的等待者，防止内存泄漏
+func (a *Applier) RemoveWaiter(requestID string) {
+	a.waiters.Delete(requestID)
 }
 
 // Apply 应用已提交的日志条目到状态机
@@ -40,9 +53,16 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 			switch parts[1] {
 			case "PUT": // 处理 PUT 命令
 				key, val := parts[2], parts[3]
-				// 写状态机失败不能吞掉：否则日志里显示「成功应用」，但数据实际没落盘
-				if err := a.mvccStorage.Put(key, val, entry.Index); err != nil {
-					return fmt.Errorf("apply PUT at index %d failed: %w", entry.Index, err)
+				// 写状态机失败不能吞掉：否则可能日志里显示成功应用，但数据实际没落盘
+				err := a.mvccStorage.Put(key, val, entry.Index)
+				// 无论成功还是失败，都要通知等待的客户端
+				if ch, ok := a.waiters.Load(requestID); ok {
+					ch.(chan error) <- err      // 发送结果
+					a.waiters.Delete(requestID) // 通知完就删掉
+				}
+				if err != nil {
+					log.Printf("[apply] 应用数据失败: %s -> %s, request ID: %s, 错误: %v\n", key, val, requestID, err)
+					return err
 				}
 				log.Printf("[apply] 成功应用数据: %s -> %s, request ID: %s\n", key, val, requestID)
 			default:

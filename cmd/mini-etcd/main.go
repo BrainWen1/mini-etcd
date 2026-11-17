@@ -1,8 +1,6 @@
 package main
 
 import (
-	"context"
-	"fmt"
 	"log"
 	"mini-etcd/internal/apply"
 	"mini-etcd/internal/backend"
@@ -77,7 +75,7 @@ func main() {
 		trans := transport.NewMemoryTransport(id, network)
 
 		// 组装 Server
-		srv := server.NewServer(cfg, storage, trans, applier)
+		srv := server.NewServer(cfg, storage, trans, applier, mvccStorage)
 		servers = append(servers, srv)
 		go srv.Start()
 	}
@@ -87,13 +85,9 @@ func main() {
 
 	// 向所有节点尝试 Propose
 	log.Println(">>> 准备发起写请求：PUT name mini-etcd")
-	requestID := fmt.Sprintf("%d", time.Now().UnixNano()) // 用唯一的请求 ID 来标识这次请求，模拟重复请求
 	for _, srv := range servers {
-		entry := fmt.Appendf([]byte{}, "%s PUT name mini-etcd", requestID)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // 设置超时时间，防止阻塞
-		err := srv.Rn.Propose(ctx, entry)                                       // 通过 RaftNode 发起提议
-		cancel()                                                                // 释放资源
+		err := srv.HandlePut("name", "mini-etcd")
 		if err != nil {
 			log.Printf("节点 %d 提议失败: %v\n", srv.Cfg.ID, err)
 		} else {
@@ -106,8 +100,12 @@ func main() {
 
 	// 模拟查询
 	for _, srv := range servers {
-		val, ok := srv.Applier.Get("name")
-		log.Printf("读取数据: name = %s, 存在=%v\n", val, ok)
+		val, err := srv.HandleGet("name")
+		if err != nil {
+			log.Printf("节点 %d 查询失败: %v\n", srv.Cfg.ID, err)
+			continue
+		}
+		log.Printf("节点 %d 查询成功: name -> %s\n", srv.Cfg.ID, val)
 	}
 
 	// 优雅退出
