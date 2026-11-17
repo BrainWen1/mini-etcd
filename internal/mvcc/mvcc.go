@@ -1,9 +1,11 @@
 package mvcc
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"mini-etcd/internal/backend"
 
 	"log"
@@ -79,28 +81,75 @@ func (m *MVCC) Put(key, value string, appliedIndex uint64) error {
 	})
 }
 
-// Get 读取普通 KV 数据，key 不存在时返回 ErrKeyNotFound
+// Get 获取指定 key 的最新值，如果 key 不存在则返回 ErrKeyNotFound
 func (m *MVCC) Get(key string) (string, error) {
-	var (
-		result string
-		found  bool
-	)
+	var result string
 	err := m.be.View(func(tx backend.ReadTx) error {
-		val := tx.Get(backend.DataBucket, []byte(key))
-		if val != nil {
-			result = string(val)
-			found = true
+		// 1. 先从 DataRevision 桶获取指定 key 的最新 revision
+		revBytes := tx.Get(backend.DataRevisionBucket, []byte(key))
+		if revBytes == nil || len(revBytes) != 8 {
+			return ErrKeyNotFound // key 不存在，直接返回错误
+		}
+		rev := binary.BigEndian.Uint64(revBytes) // 把 8 字节的 []byte 转成 uint64
+
+		// 2. 再从 Data 桶获取对应 revision 的值
+		keyWithRev := backend.GetKeyWithRevision(key, rev)
+		valBytes := tx.Get(backend.DataBucket, []byte(keyWithRev))
+		if valBytes == nil {
+			return ErrKeyNotFound // key 对应的值不存在，返回错误
+		}
+		result = string(valBytes)
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return result, nil
+}
+
+// GetAtRevision 获取指定 key 在指定的 revision 上限下的最新值，如果 key 不存在则返回 ErrKeyNotFound
+func (m *MVCC) GetAtRevision(key string, maxRev uint64) (string, error) {
+	prefix := fmt.Appendf([]byte{}, "%s\x00", key) // 构造前缀 key\x00
+	var result string
+	var found bool = false // 标记是否找到符合条件的版本
+
+	err := m.be.View(func(tx backend.ReadTx) error {
+		c := tx.GetCursor(backend.DataBucket) // 获取 DataBucket 的游标
+		if c == nil {
+			return nil
+		}
+
+		// 遍历所有以 prefix 开头的 key，找到 revision 小于等于 maxRev 的最大版本
+		k, v := c.Seek(prefix)                       // Seek 会返回第一个大于等于 prefix 的 key-value 对
+		for k != nil && bytes.HasPrefix(k, prefix) { // 边界判断
+			// 从 key\x00rev 中解析出 rev
+			_, rev := parseKeyAndRevision(k)
+			if rev > maxRev { // 超出目标版本，停止，因为 bbolt 底层的 B+ tree 是按 key 升序排列的，后续的 rev 只会更大
+				break
+			}
+			result = string(v) // 持续覆盖，最后留下的就是 <= maxRev 的最大版本
+			found = true       // 标记找到了符合条件的版本
+			k, v = c.Next()    // 移动到下一个符合前缀的 key
 		}
 		return nil
 	})
 	if err != nil {
-		log.Printf("Failed to get key %s: %v", key, err)
 		return "", err
 	}
 	if !found {
-		return "", ErrKeyNotFound
+		return "", ErrKeyNotFound // 没有找到符合条件的版本，返回错误
 	}
 	return result, nil
+}
+
+// parseKeyAndRevision 从 key\x00rev 中解析出 key 和 rev
+func parseKeyAndRevision(key []byte) (string, uint64) {
+	parts := bytes.SplitN(key, []byte("\x00"), 2)
+	if len(parts) != 2 {
+		return string(key), 0 // 如果没有分隔符，返回原始 key 和 rev=0
+	}
+	rev := binary.BigEndian.Uint64(parts[1])
+	return string(parts[0]), rev
 }
 
 // GetConsistentIndex 读取当前已应用的最高日志索引（供 main 启动时恢复 Raft 状态用）
