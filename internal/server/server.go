@@ -10,6 +10,7 @@ import (
 	"mini-etcd/internal/raftnode"
 	"mini-etcd/internal/storage"
 	"mini-etcd/internal/transport"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,6 +23,11 @@ type Server struct {
 	Applier *apply.Applier
 	storage *storage.WAL
 	mvcc    *mvcc.MVCC
+
+	// reqSeq 为每个写请求生成进程内唯一 ID。
+	// 不能用 time.Now().UnixNano()：高并发下可能取到相同值，导致 waiter 的 key 冲突，
+	// 轻则某个请求一直等到超时，重则客户端收到另一个请求的执行结果。
+	reqSeq atomic.Uint64
 
 	stopc chan struct{}
 }
@@ -54,15 +60,19 @@ func (s *Server) Stop() {
 
 // HandlePut 处理客户端的 PUT 请求，提交给 Raft 提议
 func (s *Server) HandlePut(key, value string) error {
-	reqID := fmt.Sprintf("%d", time.Now().UnixNano())
-	cmd := fmt.Sprintf("%s PUT %s %s", reqID, key, value)
+	// 节点 ID + 自增序号，保证同一进程内唯一；跨节点也不会冲突
+	reqID := fmt.Sprintf("%d-%d", s.Cfg.ID, s.reqSeq.Add(1))
+	cmd, err := apply.EncodePutCommand(reqID, key, value)
+	if err != nil {
+		return fmt.Errorf("encode command failed: %w", err)
+	}
 
 	// 1. 先注册 waiter，拿到等待的 channel
 	waitCh := s.Applier.RegisterWaiter(reqID)
 
 	// 2. 将请求提交给 Raft
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // 设置超时时间，防止阻塞
-	err := s.Rn.Node.Propose(ctx, []byte(cmd))
+	err = s.Rn.Node.Propose(ctx, cmd)
 	cancel() // 释放资源
 	if err != nil {
 		// 如果提议失败（比如超时或节点不是 Leader），要把 waiter 清理掉

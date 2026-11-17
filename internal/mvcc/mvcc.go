@@ -3,6 +3,7 @@ package mvcc
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -122,8 +123,14 @@ func (m *MVCC) GetAtRevision(key string, maxRev uint64) (string, error) {
 		// 遍历所有以 prefix 开头的 key，找到 revision 小于等于 maxRev 的最大版本
 		k, v := c.Seek(prefix)                       // Seek 会返回第一个大于等于 prefix 的 key-value 对
 		for k != nil && bytes.HasPrefix(k, prefix) { // 边界判断
-			// 从 key\x00rev 中解析出 rev
-			_, rev := parseKeyAndRevision(k)
+			// 合法版本的 key 长度固定为 len(prefix) + 8（8 字节大端序 revision）。
+			// 用户 key 本身可能包含 \x00，此时形如 "key\x00other" 的其它 key 的版本
+			// 也会落进 prefix 区间；用长度做精确判断，避免把别的 key 的 value 当成结果返回。
+			if len(k) != len(prefix)+8 {
+				k, v = c.Next()
+				continue
+			}
+			rev := binary.BigEndian.Uint64(k[len(prefix):]) // 直接从固定偏移解析 rev
 			if rev > maxRev { // 超出目标版本，停止，因为 bbolt 底层的 B+ tree 是按 key 升序排列的，后续的 rev 只会更大
 				break
 			}
@@ -145,8 +152,8 @@ func (m *MVCC) GetAtRevision(key string, maxRev uint64) (string, error) {
 // parseKeyAndRevision 从 key\x00rev 中解析出 key 和 rev
 func parseKeyAndRevision(key []byte) (string, uint64) {
 	parts := bytes.SplitN(key, []byte("\x00"), 2)
-	if len(parts) != 2 {
-		return string(key), 0 // 如果没有分隔符，返回原始 key 和 rev=0
+	if len(parts) != 2 || len(parts[1]) != 8 { // 长度不对说明不是本格式的 key，返回 rev=0 由调用方忽略
+		return string(key), 0
 	}
 	rev := binary.BigEndian.Uint64(parts[1])
 	return string(parts[0]), rev
@@ -174,6 +181,31 @@ type MVCCSnapshot struct {
 	Meta map[string][]byte `json:"meta"`
 }
 
+// snapshotMagic 标识当前快照使用 gob 编码。
+//
+// 早期版本直接用 encoding/json 序列化 MVCCSnapshot，但 Data 桶的 key 是
+// "用户 key + \x00 + 8 字节二进制 revision"，其中 revision 的字节很可能不是
+// 合法 UTF-8（例如 revision=128 时最后一位是 0x80）。encoding/json 在序列化
+// 字符串时会把非法 UTF-8 字节替换成 U+FFFD（EF BF BD），于是快照恢复后 key
+// 被改写，数据永久丢失。gob 是二进制安全的，可以原样保留任意字节。
+var snapshotMagic = []byte("MVC2")
+
+// decodeSnapshot 解析快照数据，兼容旧版本的 JSON 格式。
+func decodeSnapshot(data []byte) (*MVCCSnapshot, error) {
+	var snap MVCCSnapshot
+	if bytes.HasPrefix(data, snapshotMagic) {
+		if err := gob.NewDecoder(bytes.NewReader(data[len(snapshotMagic):])).Decode(&snap); err != nil {
+			return nil, err
+		}
+		return &snap, nil
+	}
+	// 旧版快照是裸 JSON（没有 magic 前缀）
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return nil, err
+	}
+	return &snap, nil
+}
+
 // GetSnapshot 获取当前状态机的全量快照数据
 func (m *MVCC) GetSnapshot() ([]byte, error) {
 	var snap MVCCSnapshot
@@ -195,26 +227,38 @@ func (m *MVCC) GetSnapshot() ([]byte, error) {
 		log.Printf("Failed to get snapshot: %v", err)
 		return nil, err
 	}
-	return json.Marshal(snap) // 这里为了简单，直接用 JSON 序列化，后续可以考虑更高效的序列化方式，比如 Protobuf
+
+	// 使用 gob 而不是 JSON：Data 桶的 key 中含有二进制 revision，JSON 会破坏非法 UTF-8 字节
+	var buf bytes.Buffer
+	buf.Write(snapshotMagic)
+	if err := gob.NewEncoder(&buf).Encode(&snap); err != nil {
+		log.Printf("Failed to encode snapshot: %v", err)
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // ApplySnapshot 从快照数据恢复状态机
 func (m *MVCC) ApplySnapshot(data []byte) error {
-	var snap MVCCSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
+	snap, err := decodeSnapshot(data)
+	if err != nil {
 		log.Printf("Failed to unmarshal snapshot data: %v", err)
 		return err
 	}
 
 	// 开启底层写事务，清空旧数据，写入新数据
 	return m.be.Update(func(tx backend.WriteTx) error {
-		// 1. 清空现有的桶
+		// 1. 清空现有的桶（DataRevision 也必须清空，否则会残留指向已不存在版本的旧索引）
 		if err := tx.ClearBucket(backend.DataBucket); err != nil {
 			log.Printf("Failed to clear Data bucket: %v", err)
 			return err
 		}
 		if err := tx.ClearBucket(backend.MetaBucket); err != nil {
 			log.Printf("Failed to clear Meta bucket: %v", err)
+			return err
+		}
+		if err := tx.ClearBucket(backend.DataRevisionBucket); err != nil {
+			log.Printf("Failed to clear DataRevision bucket: %v", err)
 			return err
 		}
 
@@ -233,6 +277,41 @@ func (m *MVCC) ApplySnapshot(data []byte) error {
 				return err
 			}
 		}
-		return nil
+
+		// 4. 根据 Data 桶重建 DataRevision 桶。
+		//    DataRevision 没有存进快照，如果这里不重建，新节点/重启节点恢复快照后
+		//    Get(key) 会因为查不到最新 revision 而全部返回 ErrKeyNotFound。
+		return rebuildDataRevision(tx)
 	})
+}
+
+// rebuildDataRevision 扫描 Data 桶，重新计算每个 key 的最新 revision 并写回 DataRevision 桶。
+func rebuildDataRevision(tx backend.WriteTx) error {
+	c := tx.GetCursor(backend.DataBucket)
+	if c == nil {
+		return nil
+	}
+
+	// 先收集每个 key 的最大 revision；不要在遍历 Data 桶的游标期间直接写其它桶，
+	// 避免游标失效（虽然写的是不同桶，但收集后再写更稳妥）。
+	latest := make(map[string]uint64)
+	for k, _ := c.First(); k != nil; k, _ = c.Next() {
+		key, rev := parseKeyAndRevision(k)
+		if rev == 0 { // 非法格式的历史脏数据，跳过
+			continue
+		}
+		if rev > latest[key] {
+			latest[key] = rev
+		}
+	}
+
+	for key, rev := range latest {
+		revBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(revBytes, rev)
+		if err := tx.Put(backend.DataRevisionBucket, []byte(key), revBytes); err != nil {
+			log.Printf("Failed to rebuild DataRevision for key %s: %v", key, err)
+			return err
+		}
+	}
+	return nil
 }

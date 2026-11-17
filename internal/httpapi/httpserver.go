@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"mini-etcd/internal/mvcc"
 	"mini-etcd/internal/server"
@@ -47,12 +48,29 @@ type ErrorResponse struct {
 	Error string `json:"error"`
 }
 
+// validateKey 拒绝会让 MVCC 组合键产生歧义或没有意义的 key：
+// 空 key，以及包含 \x00 的 key（存储层用 \x00 分隔用户 key 和 8 字节 revision）。
+// 注意 GET 路径参数会被 URL 解码，客户端发送 %00 同样能构造出 NUL 字节。
+func validateKey(key string) error {
+	if key == "" {
+		return errors.New("key must not be empty")
+	}
+	if strings.ContainsRune(key, 0) {
+		return errors.New("key must not contain NUL byte")
+	}
+	return nil
+}
+
 // handlePut 处理 POST /v1/kv
 func (h *HTTPServer) handlePut(w http.ResponseWriter, r *http.Request) {
 	var req PutRequest
 	// 解析 JSON Body
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if err := validateKey(req.Key); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -71,9 +89,18 @@ func (h *HTTPServer) handlePut(w http.ResponseWriter, r *http.Request) {
 func (h *HTTPServer) handleGet(w http.ResponseWriter, r *http.Request) {
 	// 获取路径参数
 	key := r.PathValue("key")
+	if err := validateKey(key); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
-	// 获取查询参数 rev (例如 ?rev=10)
+	// 获取查询参数 revision (例如 ?revision=10)
+	// 同时兼容提交说明中使用的 ?rev=10：否则未知参数会被静默忽略，
+	// 客户端以为读的是历史版本，实际拿到的是最新值。
 	revStr := r.URL.Query().Get("revision")
+	if revStr == "" {
+		revStr = r.URL.Query().Get("rev")
+	}
 
 	var val string
 	var err error
