@@ -57,7 +57,7 @@ func (m *MVCC) Put(key, value string, appliedIndex uint64) error {
 
 		// 3. 写入 Data 桶，key + revision 作为唯一标识，保证同一个 key 的不同版本可以共存
 		keyBytes := backend.GetKeyWithRevision(key, currentRev)
-		if err := tx.Put(backend.DataBucket, []byte(keyBytes), []byte(value)); err != nil {
+		if err := tx.Put(backend.DataBucket, keyBytes, []byte(value)); err != nil {
 			log.Printf("Failed to put key %s: %v", key, err)
 			return err
 		}
@@ -94,7 +94,7 @@ func (m *MVCC) Get(key string) (string, error) {
 
 		// 2. 再从 Data 桶获取对应 revision 的值
 		keyWithRev := backend.GetKeyWithRevision(key, rev)
-		valBytes := tx.Get(backend.DataBucket, []byte(keyWithRev))
+		valBytes := tx.Get(backend.DataBucket, keyWithRev)
 		if valBytes == nil {
 			return ErrKeyNotFound // key 对应的值不存在，返回错误
 		}

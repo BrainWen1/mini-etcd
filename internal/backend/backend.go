@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -21,9 +22,16 @@ const (
 )
 
 // GetKeyWithRevision 生成带 revision 的 key，用于存储在 DataBucket 中
-func GetKeyWithRevision(key string, revision uint64) string {
-	// 使用不可见字符 \x00 作为分隔符，避免 key 和 revision 拼接后产生歧义
-	return fmt.Sprintf("%s\x00%d", key, revision)
+func GetKeyWithRevision(key string, revision uint64) []byte {
+	keyBytes := []byte(key)
+	// 分配 len(key) + 1 (分隔符) + 8 (revision) 字节的切片
+	res := make([]byte, len(keyBytes)+1+8)
+	copy(res, keyBytes)
+
+	res[len(keyBytes)] = 0 // \x00 分隔符
+	// 将 revision 的 8 字节大端序直接写在后边
+	binary.BigEndian.PutUint64(res[len(keyBytes)+1:], revision)
+	return res
 }
 
 // Backend 封装底层的 bbolt

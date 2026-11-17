@@ -5,12 +5,14 @@ import (
 	"mini-etcd/internal/apply"
 	"mini-etcd/internal/backend"
 	"mini-etcd/internal/config"
+	"mini-etcd/internal/httpapi"
 	"mini-etcd/internal/mvcc"
 	"mini-etcd/internal/server"
 	"mini-etcd/internal/storage"
 	"mini-etcd/internal/transport"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -80,32 +82,18 @@ func main() {
 		go srv.Start()
 	}
 
-	// 等待一段时间让节点启动并选出 Leader
-	time.Sleep(2 * time.Second)
-
-	// 向所有节点尝试 Propose
-	log.Println(">>> 准备发起写请求：PUT name mini-etcd")
-	for _, srv := range servers {
-
-		err := srv.HandlePut("name", "mini-etcd")
-		if err != nil {
-			log.Printf("节点 %d 提议失败: %v\n", srv.Cfg.ID, err)
-		} else {
-			log.Printf("节点 %d 提议成功\n", srv.Cfg.ID)
-		}
-	}
-
-	// 等待日志复制并应用
-	time.Sleep(2 * time.Second)
-
-	// 模拟查询
-	for _, srv := range servers {
-		val, err := srv.HandleGet("name")
-		if err != nil {
-			log.Printf("节点 %d 查询失败: %v\n", srv.Cfg.ID, err)
-			continue
-		}
-		log.Printf("节点 %d 查询成功: name -> %s\n", srv.Cfg.ID, val)
+	time.Sleep(2 * time.Second) // 先等待节点集群选出 Leader
+	// 启动 HTTP 服务
+	// 给每个节点都启动一个 HTTP 服务，监听不同的端口
+	for idx, srv := range servers {
+		hServer := httpapi.NewHTTPServer(srv)
+		port := 10000 + idx // 每个节点的 HTTP 服务端口不同
+		// 注意，port 不能在 goroutine 里直接使用 idx，否则异步环境下可能会捕获到错误的 idx 值，导致监听端口混乱
+		go func(port int) {
+			if err := hServer.Start(strconv.Itoa(port)); err != nil {
+				log.Fatalf("HTTP server failed: %v", err)
+			}
+		}(port)
 	}
 
 	// 优雅退出
