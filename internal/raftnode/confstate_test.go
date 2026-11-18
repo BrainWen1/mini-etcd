@@ -118,7 +118,11 @@ func TestConfStateFallback(t *testing.T) {
 	defer w.Close()
 
 	// 启动配置里，集群成员是 1、2、3。这是兜底数据的来源。
-	cfg := config.Default(1, []uint64{1, 2, 3})
+	cfg := config.Default(1, map[uint64]string{
+		1: "127.0.0.1:8001",
+		2: "127.0.0.1:8002",
+		3: "127.0.0.1:8003",
+	})
 
 	// 真正调用被测函数。修复前：rn.confState.Voters 为空（bug）。
 	// 修复后：打一条 Warning，并把 Voters 填成 [1 2 3]。

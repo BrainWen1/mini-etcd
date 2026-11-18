@@ -3,6 +3,7 @@ package raftnode
 import (
 	"log"
 	"mini-etcd/internal/config"
+	"slices"
 
 	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
@@ -48,10 +49,19 @@ type RaftNode struct {
 
 // NewRaftNode 创建一个新的 RaftNode 实例
 func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Applier) *RaftNode {
-	// 将 cfg.Peers 转换为 raft.Peer 列表
-	var rpeers []raft.Peer
-	for _, p := range cfg.Peers {
-		rpeers = append(rpeers, raft.Peer{ID: p})
+	// 将 cfg.Peers 转换为 raft.Peer 列表。
+	// 必须按节点 ID 升序构造：raft.StartNode 会按这个顺序生成初始的 ConfChange
+	// 日志条目，所有节点必须以完全相同的顺序 Bootstrap。直接遍历 map 的顺序是
+	// 随机的，会让各节点在相同日志下标上得到不同内容，破坏 Raft 的日志一致性前提。
+	peersIDs := make([]uint64, 0, len(cfg.Peers))
+	for id := range cfg.Peers {
+		peersIDs = append(peersIDs, id)
+	}
+	slices.Sort(peersIDs)
+
+	rpeers := make([]raft.Peer, 0, len(peersIDs))
+	for _, id := range peersIDs {
+		rpeers = append(rpeers, raft.Peer{ID: id, Context: []byte(cfg.Peers[id])})
 	}
 
 	// 从已经持久化的 Storage 中获取 lastIndex 和 HardState，以便正确初始化 Raft 节点
@@ -93,7 +103,7 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 		// Bootstrap 后立刻打一个初始快照，把 ConfState 持久化
 		// 快照的 index 传 1（MemoryStorage初始化时自带一个空快照），data 传 nil（状态机是空的）
 		// 手动构造一个包含 ConfState 的快照对象，绕过 CreateSnapshot 的内存检查
-		confState = raftpb.ConfState{Voters: cfg.Peers}
+		confState = raftpb.ConfState{Voters: peersIDs}
 		snap := raftpb.Snapshot{
 			Metadata: raftpb.SnapshotMetadata{
 				Index:     1, // 设为 1 即可，只要大于初始的 0
@@ -105,7 +115,7 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 		if err := storage.SaveSnapshot(snap); err != nil {
 			log.Fatalf("Failed to save initial snapshot: %v", err)
 		}
-		log.Printf("[Node %d] 已生成初始快照文件 (index=1)，ConfState.Voters=%v", cfg.ID, cfg.Peers)
+		log.Printf("[Node %d] 已生成初始快照文件 (index=1)，ConfState.Voters=%v", cfg.ID, peersIDs)
 	} else {
 		// 如果有日志或 HardState，说明是重启节点，需要从持久化存储中恢复
 		log.Printf("[Node %d] 检测到 WAL，重新启动 Raft 节点 (Restart)", cfg.ID)
@@ -123,8 +133,8 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 			// 快照里没带 ConfState（例如旧版本写出的快照，或者快照目录被清空只剩 WAL），
 			// 若让 confState 保持零值，后续本地快照会把空的 ConfState 写进磁盘，
 			// 重启后 voters=() 会让集群配置永久丢失。这里回退到配置里的 peers 兜底。
-			log.Printf("[Node %d] Warning: empty ConfState in storage, falling back to configured peers %v", cfg.ID, cfg.Peers)
-			confState = raftpb.ConfState{Voters: cfg.Peers}
+			log.Printf("[Node %d] Warning: empty ConfState in storage, falling back to configured peers %v", cfg.ID, peersIDs)
+			confState = raftpb.ConfState{Voters: peersIDs}
 		}
 	}
 

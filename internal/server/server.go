@@ -19,7 +19,7 @@ type Server struct {
 	Cfg config.Config
 	Rn  *raftnode.RaftNode // server 持有其对应的 Raft 节点的引用
 
-	trans   *transport.MemoryTransport
+	trans   *transport.TCPTransport
 	Applier *apply.Applier
 	storage *storage.WAL
 	mvcc    *mvcc.MVCC
@@ -33,7 +33,7 @@ type Server struct {
 }
 
 // NewServer 创建一个新的 Server 实例
-func NewServer(cfg config.Config, storage *storage.WAL, trans *transport.MemoryTransport, applier *apply.Applier, mvcc *mvcc.MVCC) *Server {
+func NewServer(cfg config.Config, storage *storage.WAL, trans *transport.TCPTransport, applier *apply.Applier, mvcc *mvcc.MVCC) *Server {
 	// 创建 RaftNode 实例
 	rn := raftnode.NewRaftNode(cfg, storage, trans, applier)
 
@@ -54,8 +54,11 @@ func (s *Server) Start() {
 }
 
 func (s *Server) Stop() {
-	// 先这样简单处理
+	// 通知 stopc 关闭，RaftNode 的 Run 循环会退出
 	close(s.stopc)
+	// 关闭监听器和所有 TCP 连接，避免进程退出前端口仍被占用、
+	// 以及收发 goroutine 继续在已停止的 Raft 循环上堆积消息
+	s.trans.Close()
 }
 
 // HandlePut 处理客户端的 PUT 请求，提交给 Raft 提议
