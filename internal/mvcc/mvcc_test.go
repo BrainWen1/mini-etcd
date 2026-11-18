@@ -2,6 +2,8 @@ package mvcc
 
 import (
 	"errors"
+	"fmt"
+	"math"
 	"testing"
 
 	"mini-etcd/internal/backend"
@@ -99,5 +101,67 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 	if idx != 4 {
 		t.Fatalf("GetConsistentIndex() = %d, want 4", idx)
+	}
+}
+
+// TestSnapshotRoundTripBinaryRevision 验证 revision >= 128 时快照仍然能完整恢复。
+//
+// Data 桶的 key 里直接拼接了 8 字节大端序 revision，revision=128 时最后一位是 0x80，
+// 不是合法 UTF-8。早期用 encoding/json 序列化快照会把这个字节替换成 U+FFFD，
+// 恢复后 key 被改写，Get 只能返回 ErrKeyNotFound。
+func TestSnapshotRoundTripBinaryRevision(t *testing.T) {
+	src := newTestMVCC(t)
+	for i := 1; i <= 200; i++ {
+		if err := src.Put("k", fmt.Sprintf("v%d", i), uint64(i)); err != nil {
+			t.Fatalf("Put(#%d): %v", i, err)
+		}
+	}
+
+	snap, err := src.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+
+	dst := newTestMVCC(t)
+	if err := dst.ApplySnapshot(snap); err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+
+	got, err := dst.Get("k")
+	if err != nil {
+		t.Fatalf("Get(k) after snapshot: %v", err)
+	}
+	if got != "v200" {
+		t.Fatalf("Get(k) = %q, want %q", got, "v200")
+	}
+
+	// 历史版本同样要能读，确认 revision 没有被破坏
+	got, err = dst.GetAtRevision("k", 150)
+	if err != nil {
+		t.Fatalf("GetAtRevision(k,150): %v", err)
+	}
+	if got != "v150" {
+		t.Fatalf("GetAtRevision(k,150) = %q, want %q", got, "v150")
+	}
+}
+
+// TestGetAtRevisionIgnoresOtherKeysWithNUL 验证用户 key 中包含 \x00 时，
+// GetAtRevision 不会把形如 "key\x00other" 的其它 key 的版本误当成自己的值返回。
+func TestGetAtRevisionIgnoresOtherKeysWithNUL(t *testing.T) {
+	m := newTestMVCC(t)
+
+	if err := m.Put("a", "mine", 1); err != nil {
+		t.Fatalf("Put(a): %v", err)
+	}
+	if err := m.Put("a\x00b", "other", 2); err != nil {
+		t.Fatalf("Put(a\\x00b): %v", err)
+	}
+
+	got, err := m.GetAtRevision("a", math.MaxUint64)
+	if err != nil {
+		t.Fatalf("GetAtRevision(a): %v", err)
+	}
+	if got != "mine" {
+		t.Fatalf(`GetAtRevision(a) = %q, want %q (读到了 "a\x00b" 的值)`, got, "mine")
 	}
 }

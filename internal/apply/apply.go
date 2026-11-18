@@ -1,7 +1,9 @@
 package apply
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"mini-etcd/internal/mvcc"
 	"strings"
@@ -9,6 +11,38 @@ import (
 
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
+
+// Command 是写请求在 Raft 日志中的编码格式。
+//
+// 旧实现用空格分隔（"reqID PUT key value"），key 或 value 只要包含空格，
+// strings.Split 就会得到超过 4 段，整条命令被静默丢弃，客户端只能等到超时。
+// 改为 JSON 后 key/value 可以是任意字符串（包括空格、换行等）。
+type Command struct {
+	RequestID string `json:"request_id"`
+	Op        string `json:"op"`
+	Key       string `json:"key"`
+	Value     string `json:"value"`
+}
+
+// EncodePutCommand 把 PUT 请求编码成可以写进 Raft 日志的字节流
+func EncodePutCommand(requestID, key, value string) ([]byte, error) {
+	return json.Marshal(Command{RequestID: requestID, Op: "PUT", Key: key, Value: value})
+}
+
+// decodeCommand 解析日志数据，并兼容旧版本的空格分隔格式
+func decodeCommand(data []byte) (Command, bool) {
+	var cmd Command
+	if err := json.Unmarshal(data, &cmd); err == nil && cmd.Op != "" {
+		return cmd, true
+	}
+
+	// 兼容旧日志："reqID PUT key value"（只可能是 value 不含空格的历史数据）
+	parts := strings.Split(string(data), " ")
+	if len(parts) == 4 {
+		return Command{RequestID: parts[0], Op: parts[1], Key: parts[2], Value: parts[3]}, true
+	}
+	return Command{}, false
+}
 
 // Applier 定义了应用已提交日志条目的接口
 type Applier struct {
@@ -19,6 +53,17 @@ type Applier struct {
 func NewApplier(mvccStorage *mvcc.MVCC) *Applier {
 	return &Applier{
 		mvccStorage: mvccStorage,
+	}
+}
+
+// notifyWaiter 唤醒等待该请求的客户端（如果客户端还没超时离开）
+func (a *Applier) notifyWaiter(requestID string, err error) {
+	if requestID == "" {
+		return
+	}
+	// LoadAndDelete 是原子操作，避免和 RemoveWaiter 竞争时重复通知
+	if ch, ok := a.waiters.LoadAndDelete(requestID); ok {
+		ch.(chan error) <- err // channel 带 1 个缓冲，不会阻塞
 	}
 }
 
@@ -42,32 +87,30 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 			continue
 		}
 
-		// 解析数据 (简单粗暴地用空格分割)
-		cmd := string(entry.Data)
-		log.Printf("[apply] 日志索引: %d, 命令: %s\n", entry.Index, cmd)
-		parts := strings.Split(cmd, " ")
+		// 解析数据
+		cmd, ok := decodeCommand(entry.Data)
+		if !ok {
+			log.Printf("[apply] 无法解析的日志索引: %d, 数据: %q\n", entry.Index, string(entry.Data))
+			continue
+		}
+		log.Printf("[apply] 日志索引: %d, 操作: %s, key: %s\n", entry.Index, cmd.Op, cmd.Key)
 
-		if len(parts) == 4 {
-			requestID := parts[0]
-
-			switch parts[1] {
-			case "PUT": // 处理 PUT 命令
-				key, val := parts[2], parts[3]
-				// 写状态机失败不能吞掉：否则可能日志里显示成功应用，但数据实际没落盘
-				err := a.mvccStorage.Put(key, val, entry.Index)
-				// 无论成功还是失败，都要通知等待的客户端
-				if ch, ok := a.waiters.Load(requestID); ok {
-					ch.(chan error) <- err      // 发送结果
-					a.waiters.Delete(requestID) // 通知完就删掉
-				}
-				if err != nil {
-					log.Printf("[apply] 应用数据失败: %s -> %s, request ID: %s, 错误: %v\n", key, val, requestID, err)
-					return err
-				}
-				log.Printf("[apply] 成功应用数据: %s -> %s, request ID: %s\n", key, val, requestID)
-			default:
-				log.Printf("[apply] 未知命令: %s\n", cmd)
+		switch cmd.Op {
+		case "PUT": // 处理 PUT 命令
+			// 写状态机失败不能吞掉：否则可能日志里显示成功应用，但数据实际没落盘
+			err := a.mvccStorage.Put(cmd.Key, cmd.Value, entry.Index)
+			// 无论成功还是失败，都要通知等待的客户端
+			a.notifyWaiter(cmd.RequestID, err)
+			if err != nil {
+				log.Printf("[apply] 应用数据失败: %s -> %s, request ID: %s, 错误: %v\n", cmd.Key, cmd.Value, cmd.RequestID, err)
+				return err
 			}
+			log.Printf("[apply] 成功应用数据: %s -> %s, request ID: %s\n", cmd.Key, cmd.Value, cmd.RequestID)
+		default:
+			// 未知命令也要唤醒客户端，否则客户端只能等到 5 秒超时
+			err := fmt.Errorf("unknown command: %s", cmd.Op)
+			a.notifyWaiter(cmd.RequestID, err)
+			log.Printf("[apply] 未知命令: %s, request ID: %s\n", cmd.Op, cmd.RequestID)
 		}
 	}
 	return nil
