@@ -28,6 +28,8 @@ func (h *HTTPServer) Start(port string) error {
 	// 注册路由
 	mux.HandleFunc("POST /v1/kv", h.handlePut)
 	mux.HandleFunc("GET /v1/kv/{key}", h.handleGet)
+	mux.HandleFunc("DELETE /v1/kv/{key}", h.handleDelete)
+	mux.HandleFunc("GET /v1/kv/range", h.handleRange)
 
 	log.Printf("HTTP API Server 启动，监听 %s", port)
 	return http.ListenAndServe(":"+port, mux)
@@ -42,6 +44,15 @@ type PutRequest struct {
 type GetResponse struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+}
+
+type RangeKV struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type RangeResponse struct {
+	KVs []RangeKV `json:"kvs"`
 }
 
 type ErrorResponse struct {
@@ -138,4 +149,60 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")   // 设置响应头为 JSON
 	w.WriteHeader(status)                                // 设置 HTTP 状态码
 	json.NewEncoder(w).Encode(ErrorResponse{Error: msg}) // 返回 JSON 错误信息
+}
+
+// handleDelete 处理 DELETE /v1/kv/{key}
+func (h *HTTPServer) handleDelete(w http.ResponseWriter, r *http.Request) {
+	// 获取路径参数
+	key := r.PathValue("key")
+	if err := validateKey(key); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// 调用底层的 HandleDelete（同步等待落盘）
+	if err := h.srv.HandleDelete(key); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// 返回成功响应
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+}
+
+// handleRange 处理 GET /v1/kv/range?prefix={prefix}&limit={limit}
+func (h *HTTPServer) handleRange(w http.ResponseWriter, r *http.Request) {
+	// 解析查询参数
+	prefix := r.URL.Query().Get("prefix")
+	if err := validateKey(prefix); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	limitStr := r.URL.Query().Get("limit")
+	limit := 100 // 默认限制为 100
+	if limitStr != "" {
+		var err error
+		limit, err = strconv.Atoi(limitStr)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "failed to parse limit: "+err.Error())
+			return
+		}
+	}
+
+	// 调用底层的 HandleRange
+	kvs, err := h.srv.HandleRange(prefix, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// 构造响应
+	resp := RangeResponse{KVs: make([]RangeKV, len(kvs))}
+	for i, kv := range kvs {
+		resp.KVs[i] = RangeKV{Key: kv.Key, Value: kv.Value}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }

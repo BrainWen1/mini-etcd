@@ -105,3 +105,41 @@ func (s *Server) HandleGetAtRevision(key string, rev uint64) (string, error) {
 	// 直接去 MVCC 层读历史数据
 	return s.mvcc.GetAtRevision(key, rev)
 }
+
+// HandleDelete 处理客户端的 DELETE 请求，提交给 Raft 提议
+func (s *Server) HandleDelete(key string) error {
+	// 节点 ID + 自增序号，保证同一进程内唯一；跨节点也不会冲突
+	reqID := fmt.Sprintf("%d-%d", s.Cfg.ID, s.reqSeq.Add(1))
+	cmd, err := apply.EncodeDeleteCommand(reqID, key)
+	if err != nil {
+		return fmt.Errorf("encode command failed: %w", err)
+	}
+
+	// 1. 先注册 waiter，拿到等待的 channel
+	waitCh := s.Applier.RegisterWaiter(reqID)
+
+	// 2. 将请求提交给 Raft
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // 设置超时时间，防止阻塞
+	err = s.Rn.Node.Propose(ctx, cmd)
+	cancel() // 释放资源
+	if err != nil {
+		// 如果提议失败（比如超时或节点不是 Leader），要把 waiter 清理掉
+		s.Applier.RemoveWaiter(reqID)
+		return fmt.Errorf("propose failed: %w", err)
+	}
+
+	// 3. 阻塞等待 Raft 应用结果
+	// 这里也要设置超时，防止 Raft 迟迟不 Apply
+	select {
+	case applyErr := <-waitCh:
+		return applyErr // 返回应用结果，可能是 nil 或者具体的错误
+	case <-time.After(5 * time.Second): // 超时兜底
+		s.Applier.RemoveWaiter(reqID)
+		return errors.New("timeout waiting for apply")
+	}
+}
+
+// HandleRange 处理客户端的 RANGE 请求，读取指定范围的数据
+func (s *Server) HandleRange(prefix string, limit int) ([]mvcc.KVPair, error) {
+	return s.mvcc.Range(prefix, limit)
+}
