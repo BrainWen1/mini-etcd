@@ -15,6 +15,9 @@ import (
 // ErrKeyNotFound 表示请求的 key 在状态机中不存在
 var ErrKeyNotFound = errors.New("mvcc: key not found")
 
+// TombstoneValue 是一个特殊的值，用于标记某个 key 已被删除。
+var TombstoneValue = []byte{0xFF}
+
 type MVCC struct {
 	be *backend.Backend
 }
@@ -96,7 +99,7 @@ func (m *MVCC) Get(key string) (string, error) {
 		// 2. 再从 Data 桶获取对应 revision 的值
 		keyWithRev := backend.GetKeyWithRevision(key, rev)
 		valBytes := tx.Get(backend.DataBucket, keyWithRev)
-		if valBytes == nil {
+		if valBytes == nil || bytes.Equal(valBytes, TombstoneValue) { // 键真的不存在或者被标记为已删除
 			return ErrKeyNotFound // key 对应的值不存在，返回错误
 		}
 		result = string(valBytes)
@@ -131,12 +134,18 @@ func (m *MVCC) GetAtRevision(key string, maxRev uint64) (string, error) {
 				continue
 			}
 			rev := binary.BigEndian.Uint64(k[len(prefix):]) // 直接从固定偏移解析 rev
-			if rev > maxRev { // 超出目标版本，停止，因为 bbolt 底层的 B+ tree 是按 key 升序排列的，后续的 rev 只会更大
+			if rev > maxRev {                               // 超出目标版本，停止，因为 bbolt 底层的 B+ tree 是按 key 升序排列的，后续的 rev 只会更大
 				break
 			}
-			result = string(v) // 持续覆盖，最后留下的就是 <= maxRev 的最大版本
-			found = true       // 标记找到了符合条件的版本
-			k, v = c.Next()    // 移动到下一个符合前缀的 key
+
+			if !bytes.Equal(v, TombstoneValue) { // 如果不是 TombstoneValue，说明找到了合法的值
+				result = string(v)
+				found = true
+			} else { // 如果是 TombstoneValue，说明这个版本被删除了，继续往前找
+				found = false // 标记为未找到合法值
+				result = ""   // 清空结果
+			}
+			k, v = c.Next() // 移动到下一个符合前缀的 key
 		}
 		return nil
 	})
@@ -314,4 +323,74 @@ func rebuildDataRevision(tx backend.WriteTx) error {
 		}
 	}
 	return nil
+}
+
+// Delete 插入 TombstoneValue 标记 key 已被删除
+func (m *MVCC) Delete(key string, appliedIndex uint64) error {
+	return m.Put(key, string(TombstoneValue), appliedIndex)
+}
+
+type KVPair struct {
+	Key   string
+	Value string
+}
+
+// Range 查询所有以 prefix 为前缀的键值对（最新版本）
+func (m *MVCC) Range(prefix string, limit int) ([]KVPair, error) {
+	var results []KVPair
+
+	// 如果 limit <= 0，默认不限制数量
+	if limit <= 0 {
+		limit = -1
+	}
+
+	err := m.be.View(func(tx backend.ReadTx) error {
+		// 1. 从 DataRevisionBucket 里扫描前缀（拿到每个 key 的最新 revision）
+		// 因为 DataRevisionBucket 里的 key 就是纯粹的 key，没有 \x00 后缀
+		c := tx.GetCursor(backend.DataRevisionBucket)
+		if c == nil {
+			return nil
+		}
+
+		prefixBytes := []byte(prefix)
+		// Seek 定位到第一个以 prefix 开头的 key
+		k, revBytes := c.Seek(prefixBytes)
+		for k != nil && bytes.HasPrefix(k, prefixBytes) {
+			// 合法版本的 revBytes 长度必须是 8 字节
+			if len(revBytes) != 8 {
+				k, revBytes = c.Next()
+				continue
+			}
+			// 如果 limit > 0 且已经收集到足够的结果，就停止遍历
+			if limit > 0 && len(results) >= limit {
+				break
+			}
+
+			rev := binary.BigEndian.Uint64(revBytes)
+			keyStr := string(k)
+
+			// 2. 根据 key 和 rev，去 DataBucket 拿具体的数据
+			keyWithRev := backend.GetKeyWithRevision(keyStr, rev)
+			valBytes := tx.Get(backend.DataBucket, keyWithRev)
+
+			if valBytes != nil {
+				if bytes.Equal(valBytes, TombstoneValue) {
+					// 如果 valBytes 是墓碑标记，跳过这个 key
+					k, revBytes = c.Next()
+					continue
+				}
+				// 收集结果
+				results = append(results, KVPair{
+					Key:   keyStr,
+					Value: string(valBytes),
+				})
+			}
+
+			// 移动到下一个 key
+			k, revBytes = c.Next()
+		}
+		return nil
+	})
+
+	return results, err
 }

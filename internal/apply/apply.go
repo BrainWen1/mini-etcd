@@ -29,6 +29,11 @@ func EncodePutCommand(requestID, key, value string) ([]byte, error) {
 	return json.Marshal(Command{RequestID: requestID, Op: "PUT", Key: key, Value: value})
 }
 
+// EncodeDeleteCommand 把 DELETE 请求编码成可以写进 Raft 日志的字节流
+func EncodeDeleteCommand(requestID, key string) ([]byte, error) {
+	return json.Marshal(Command{RequestID: requestID, Op: "DELETE", Key: key})
+}
+
 // decodeCommand 解析日志数据，并兼容旧版本的空格分隔格式
 func decodeCommand(data []byte) (Command, bool) {
 	var cmd Command
@@ -106,6 +111,14 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 				return err
 			}
 			log.Printf("[apply] 成功应用数据: %s -> %s, request ID: %s\n", cmd.Key, cmd.Value, cmd.RequestID)
+		case "DELETE": // 处理 DELETE 命令
+			err := a.mvccStorage.Delete(cmd.Key, entry.Index)
+			a.notifyWaiter(cmd.RequestID, err)
+			if err != nil {
+				log.Printf("[apply] 删除数据失败: %s, request ID: %s, 错误: %v\n", cmd.Key, cmd.RequestID, err)
+				return err
+			}
+			log.Printf("[apply] 成功删除数据: %s, request ID: %s\n", cmd.Key, cmd.RequestID)
 		default:
 			// 未知命令也要唤醒客户端，否则客户端只能等到 5 秒超时
 			err := fmt.Errorf("unknown command: %s", cmd.Op)
