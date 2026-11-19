@@ -29,8 +29,12 @@ const (
 // peerConn 包装 net.Conn，额外提供写锁。
 // 即使将来 Send 从多个 goroutine 调用，同一条连接上的帧也不会互相交错。
 type peerConn struct {
-	net.Conn
-	writeMu sync.Mutex
+	netConn net.Conn
+	connMu  sync.Mutex // 保护 Conn 的读写，避免并发读写导致数据错乱
+
+	id    uint64              // 目标节点 ID
+	sendC chan raftpb.Message // 异步发送消息的通道
+	stopC chan struct{}       // 停止信号，用于唤醒阻塞中的发送 goroutine
 }
 
 // TCPTransport 是一个基于 TCP 的 Raft 消息传输实现
@@ -154,45 +158,20 @@ func (t *TCPTransport) Send(msgs []raftpb.Message) {
 			continue
 		}
 
-		// 将消息序列化为字节流
-		data, err := m.Marshal()
-		if err != nil {
-			log.Printf("failed to marshal message to node %d: %v", m.To, err)
-			continue
-		}
-		if len(data) > maxMessageSize {
-			// 消息过大，直接丢弃。Raft 会通过重试/心跳重新发送。
-			log.Printf("message to node %d too large (%d bytes), dropped", m.To, len(data))
+		// 获取逻辑连接
+		pc := t.getConn(m.To)
+		if pc == nil {
 			continue
 		}
 
-		// 根据 m.To 找到目标节点地址
-		conn := t.getConn(m.To)
-		if conn == nil {
-			// 连接不可用：丢弃该消息，Raft 会通过重试/心跳重新发送。
-			// 这里不打印日志，避免对端长期宕机时按心跳频率刷屏；
-			// getConn 对建连失败已经做了限频日志。
-			continue
-		}
-
-		// 长度头和消息体合并成一次 Write：既避免两次写之间被其他写入打断，
-		// 也保证接收端不会读到半截帧。
-		frame := make([]byte, 4+len(data))
-		binary.BigEndian.PutUint32(frame[:4], uint32(len(data)))
-		copy(frame[4:], data)
-
-		// 写超时必不可少：对端主机失联（半开连接）时，TCP 重传可能让
-		// conn.Write 阻塞数分钟，而 Send 是在 Raft 的单线程主循环里调用的，
-		// 会连带卡死 Tick、Ready 处理以及对其他节点的回复。
-		conn.writeMu.Lock()
-		_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-		_, err = conn.Write(frame)
-		conn.writeMu.Unlock()
-		if err != nil {
-			log.Printf("failed to write message to node %d: %v", m.To, err)
-			// 连接已不可用（可能只写了一半），关闭后由下一次 Send 重新建连
-			t.closeConn(m.To, conn)
-			continue
+		// 非阻塞推入队列
+		select {
+		case pc.sendC <- m:
+			// 入队成功
+		default:
+			// 队列已满（网络太慢），直接丢弃
+			// 不要在这里阻塞，Raft 的心跳和重试机制会保证最终一致。
+			log.Printf("[Node %d] send queue full for node %d, dropping message", t.id, m.To)
 		}
 	}
 }
@@ -219,81 +198,167 @@ func (t *TCPTransport) Close() {
 		}
 
 		// 关闭所有已建立的连接
-		for _, conn := range conns {
-			conn.Close()
+		for _, pc := range conns {
+			close(pc.stopC) // 通知 writeLoop 退出
+			pc.connMu.Lock()
+			if pc.netConn != nil {
+				pc.netConn.Close() // 关闭底层 TCP
+			}
+			pc.connMu.Unlock()
 		}
 	})
 }
 
 // getConn 根据节点 ID 获取对应的 TCP 连接，如果不存在则创建新的连接
 func (t *TCPTransport) getConn(to uint64) *peerConn {
-	// 如果已经有连接，直接返回
+	// 如果已经有逻辑连接，直接返回
 	t.mu.RLock()
 	if t.closed {
 		t.mu.RUnlock()
 		return nil
 	}
-	conn, ok := t.conns[to]
-	lastFailed, failedBefore := t.failedTime[to]
+	if pc, ok := t.conns[to]; ok {
+		t.mu.RUnlock()
+		return pc
+	}
 	t.mu.RUnlock()
-	if ok {
-		return conn
+
+	// 创建逻辑连接
+	pc := &peerConn{
+		id:    to,
+		sendC: make(chan raftpb.Message, 1024), // 缓冲区大小可调
+		stopC: make(chan struct{}),
 	}
 
-	// 如果之前连接失败，且在冷却期内，直接放弃重连
-	if failedBefore && time.Since(lastFailed) < retryInterval {
-		return nil
-	}
-
-	addr, ok := t.peers[to]
-	if !ok || addr == "" {
-		t.recordFailure(to)
-		log.Printf("no address configured for node %d", to)
-		return nil
-	}
-
-	newConn, err := net.DialTimeout("tcp", addr, dialTimeout) // 建立 TCP 连接
-	if err != nil {
-		// 记录失败时间，进入冷却期，避免每条消息都阻塞在 Dial 上
-		t.recordFailure(to)
-		// 只在这里（冷却期过后）打印日志
-		log.Printf("failed to connect to node %d (%s): %v", to, addr, err)
-		return nil
-	}
-	pc := &peerConn{Conn: newConn}
-
+	// 在写锁内二次检查：Close 可能刚把 conns 换成了新 map，
+	// 这时再插入会得到一个永远不会被 Close 回收的逻辑连接；
+	// 并发调用 Send 时也可能重复创建，必须复用已有的那一个。
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.closed {
-		// 建连期间 Close 被调用，不要再把连接放回池子
-		newConn.Close()
+		t.mu.Unlock()
 		return nil
 	}
-	// Double check (防止并发时重复创建)
 	if existing, ok := t.conns[to]; ok {
-		newConn.Close()
+		t.mu.Unlock()
 		return existing
 	}
-	// 连接成功，清除失败时间记录
-	delete(t.failedTime, to)
 	t.conns[to] = pc
+	t.mu.Unlock()
+
+	go t.writeLoop(pc) // 启动发送 goroutine
+
 	return pc
 }
 
-// recordFailure 记录一次建连失败，使 getConn 在冷却期内不再重试
+// writeLoop 异步处理发送队列
+func (t *TCPTransport) writeLoop(pc *peerConn) {
+	for {
+		select {
+		case <-t.done:
+			return
+		case <-pc.stopC:
+			return
+		case m := <-pc.sendC:
+			// 真正发送消息
+			t.sendMsgToPeer(pc, m)
+		}
+	}
+}
+
+func (t *TCPTransport) sendMsgToPeer(pc *peerConn, m raftpb.Message) {
+	data, err := m.Marshal()
+	if err != nil {
+		log.Printf("failed to marshal message to node %d: %v", pc.id, err)
+		return
+	}
+	// 发送端也要限制大小：接收端对超过 maxMessageSize 的帧会直接断开连接，
+	// 如果这里放行，超大消息会让两边陷入"断开-重连-再发同一条消息"的循环。
+	if len(data) > maxMessageSize {
+		log.Printf("message to node %d too large (%d bytes), dropped", pc.id, len(data))
+		return
+	}
+
+	// 组帧
+	frame := make([]byte, 4+len(data))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(data)))
+	copy(frame[4:], data)
+
+	// 1. 获取物理连接（如果不存在或已断开，尝试重连）
+	conn := t.dialIfNeeded(pc)
+	if conn == nil {
+		return // 连接不可用，丢弃这条消息
+	}
+
+	// 2. 写入数据（带超时）
+	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	_, err = conn.Write(frame)
+	if err != nil {
+		log.Printf("failed to write to node %d: %v", pc.id, err)
+		// 只丢弃坏掉的物理连接，保留逻辑连接和它的 writeLoop：
+		//   - 若把 pc 从 conns 里删掉，这个 writeLoop 就再也没人引用，
+		//     会一直阻塞在 sendC 上，且 stopC 永远不关闭 -> goroutine/fd 泄漏；
+		//   - 同时 Send 会为同一节点再建一个 pc，导致一个节点对应多条 TCP
+		//     连接、两个发送 goroutine 并发写，消息顺序也无法保证。
+		// 置 nil 后，下一条消息会在冷却期结束后由同一个 writeLoop 重新建连。
+		pc.connMu.Lock()
+		if pc.netConn != nil {
+			pc.netConn.Close()
+			pc.netConn = nil
+		}
+		pc.connMu.Unlock()
+		t.recordFailure(pc.id)
+	}
+}
+
+// dialIfNeeded 负责建立或获取物理连接，带失败冷却机制
+func (t *TCPTransport) dialIfNeeded(pc *peerConn) net.Conn {
+	pc.connMu.Lock()
+	defer pc.connMu.Unlock()
+
+	// 连接还在，直接用
+	if pc.netConn != nil {
+		return pc.netConn
+	}
+
+	// 检查冷却期；同时确认 transport 没有在拨号期间被关闭，
+	// 否则 Close 之后 writeLoop 仍可能新建一条无人关闭的出站连接。
+	t.mu.RLock()
+	closed := t.closed
+	lastFailed, failedBefore := t.failedTime[pc.id]
+	t.mu.RUnlock()
+
+	if closed {
+		// transport 已关闭，放弃拨号
+		return nil
+	}
+	if failedBefore && time.Since(lastFailed) < retryInterval {
+		return nil // 冷却期内，放弃重试
+	}
+
+	addr, ok := t.peers[pc.id]
+	if !ok || addr == "" {
+		return nil
+	}
+
+	// 真正建立 TCP 连接
+	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+	if err != nil {
+		t.recordFailure(pc.id) // 记录失败时间
+		log.Printf("failed to connect to node %d (%s): %v", pc.id, addr, err)
+		return nil
+	}
+
+	pc.netConn = conn
+	t.mu.Lock()
+	delete(t.failedTime, pc.id) // 连接成功，清除冷却
+	t.mu.Unlock()
+
+	return conn
+}
+
+// recordFailure 记录一次建连/写失败，使 dialIfNeeded 在冷却期内不再重试
 func (t *TCPTransport) recordFailure(to uint64) {
 	t.mu.Lock()
 	t.failedTime[to] = time.Now()
 	t.mu.Unlock()
-}
-
-// closeConn 关闭 to 的连接：只有 conn 仍是当前在用的那条连接时才关闭并移除，
-// 避免误关其他 goroutine 新建的连接。
-func (t *TCPTransport) closeConn(to uint64, conn *peerConn) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if cur, ok := t.conns[to]; ok && cur == conn {
-		cur.Close()
-		delete(t.conns, to)
-	}
 }

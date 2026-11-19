@@ -43,3 +43,85 @@ func TestTCPTransportSendRecv(t *testing.T) {
 		t.Fatal("timed out waiting for message")
 	}
 }
+
+// TestTCPTransportSendOrder 验证异步发送仍然保持同一节点内的消息顺序。
+func TestTCPTransportSendOrder(t *testing.T) {
+	peers := map[uint64]string{}
+	t2 := newTestTransport(t, 2, peers)
+	peers[2] = t2.listener.Addr().String()
+	t1 := newTestTransport(t, 1, peers)
+
+	const n = 200 // 小于 sendC 的缓冲区大小，避免触发"队列满丢弃"
+	for i := 1; i <= n; i++ {
+		t1.Send([]raftpb.Message{{
+			From: 1, To: 2, Type: raftpb.MsgApp, Term: 1, Index: uint64(i),
+		}})
+	}
+
+	for i := 1; i <= n; i++ {
+		select {
+		case got := <-t2.Recv():
+			if got.Index != uint64(i) {
+				t.Fatalf("message %d: got index %d, want %d", i, got.Index, i)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for message %d", i)
+		}
+	}
+}
+
+// TestTCPTransportReconnectAfterWriteError 验证写失败后逻辑连接不会被丢弃：
+// 同一个 writeLoop 应在冷却期结束后重新建连并继续发送，否则每失败一次
+// 就会泄漏一个 goroutine 和一条 fd，且同一节点会出现多条并发连接。
+func TestTCPTransportReconnectAfterWriteError(t *testing.T) {
+	peers := map[uint64]string{}
+	t2 := newTestTransport(t, 2, peers)
+	peers[2] = t2.listener.Addr().String()
+	t1 := newTestTransport(t, 1, peers)
+
+	recvIndex := func(want uint64) {
+		t.Helper()
+		select {
+		case got := <-t2.Recv():
+			if got.Index != want {
+				t.Fatalf("got index %d, want %d", got.Index, want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for index %d", want)
+		}
+	}
+
+	t1.Send([]raftpb.Message{{From: 1, To: 2, Type: raftpb.MsgApp, Term: 1, Index: 1}})
+	recvIndex(1)
+
+	t1.mu.RLock()
+	pc := t1.conns[2]
+	t1.mu.RUnlock()
+	if pc == nil {
+		t.Fatal("no logical connection for node 2")
+	}
+
+	// 模拟底层 TCP 连接被网络/对端断开。
+	pc.connMu.Lock()
+	conn := pc.netConn
+	pc.connMu.Unlock()
+	if conn == nil {
+		t.Fatal("physical connection was not established")
+	}
+	conn.Close()
+
+	// 这条消息会写失败并触发重连退避。
+	t1.Send([]raftpb.Message{{From: 1, To: 2, Type: raftpb.MsgApp, Term: 1, Index: 2}})
+	time.Sleep(retryInterval + 300*time.Millisecond)
+
+	// 冷却期过后，应由同一个逻辑连接重新建连并成功送达。
+	t1.Send([]raftpb.Message{{From: 1, To: 2, Type: raftpb.MsgApp, Term: 1, Index: 3}})
+	recvIndex(3)
+
+	t1.mu.RLock()
+	pcAfter := t1.conns[2]
+	t1.mu.RUnlock()
+	if pcAfter != pc {
+		t.Fatal("logical connection was replaced after write error; old writeLoop would leak")
+	}
+}
