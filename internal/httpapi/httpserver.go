@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -103,6 +105,12 @@ func validateKey(key string) error {
 
 // handlePut 处理 POST /v1/kv
 func (h *HTTPServer) handlePut(w http.ResponseWriter, r *http.Request) {
+	if h.proxyToLeader(w, r) {
+		// 请求被代理到 Leader，当前节点不再处理
+		return
+	}
+	// 当前节点是 Leader，继续处理请求
+
 	var req PutRequest
 	// 解析 JSON Body
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -182,6 +190,12 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 
 // handleDelete 处理 DELETE /v1/kv/{key}
 func (h *HTTPServer) handleDelete(w http.ResponseWriter, r *http.Request) {
+	if h.proxyToLeader(w, r) {
+		// 请求被代理到 Leader，当前节点不再处理
+		return
+	}
+	// 当前节点是 Leader，继续处理请求
+
 	// 获取路径参数
 	key := r.PathValue("key")
 	if err := validateKey(key); err != nil {
@@ -244,6 +258,12 @@ func (h *HTTPServer) handleRange(w http.ResponseWriter, r *http.Request) {
 //	  "failure":  [{"op": "DELETE", "key": "b"}]
 //	}
 func (h *HTTPServer) handleTxn(w http.ResponseWriter, r *http.Request) {
+	if h.proxyToLeader(w, r) {
+		// 请求被代理到 Leader，当前节点不再处理
+		return
+	}
+	// 当前节点是 Leader，继续处理请求
+
 	var req TxnRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json body")
@@ -270,4 +290,41 @@ func (h *HTTPServer) handleTxn(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+}
+
+// proxyToLeader 检查当前节点是否是 Leader，如果不是，则将请求代理到 Leader 节点。
+func (h *HTTPServer) proxyToLeader(w http.ResponseWriter, r *http.Request) bool {
+	if h.srv.IsLeader() {
+		return false // 自己是 Leader，不需要代理，放行
+	}
+
+	leaderAddr := h.srv.GetLeaderHTTPAddr()
+	if leaderAddr == "" {
+		// 没有选出 Leader，返回 503 Service Unavailable
+		http.Error(w, "no leader elected yet", http.StatusServiceUnavailable)
+		return true // 处理了，不放行
+	}
+
+	// 如果请求本身带有内部代理标记，但自己还是 Follower，直接报错
+	if r.Header.Get("X-Internal-Proxy") == "true" {
+		http.Error(w, "proxy loop detected or lost leadership", http.StatusServiceUnavailable)
+		return true
+	}
+
+	// 构建目标 Leader 的 URL
+	targetURL, _ := url.Parse("http://" + leaderAddr)
+	proxy := httputil.NewSingleHostReverseProxy(targetURL) // 创建反向代理
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		// 代理请求失败时的处理
+		log.Printf("[Proxy Error] 代理到 %s 失败: %v", targetURL, err)
+		http.Error(w, "proxy failed: "+err.Error(), http.StatusBadGateway)
+	}
+
+	// 防止无限代理：加上内部标记
+	r.Header.Set("X-Internal-Proxy", "true")
+
+	// 执行代理转发
+	log.Printf("[Proxy] 将请求代理到 Leader %s: %s %s", leaderAddr, r.Method, r.URL.Path)
+	proxy.ServeHTTP(w, r)
+	return true // 处理完毕，不放行原逻辑
 }

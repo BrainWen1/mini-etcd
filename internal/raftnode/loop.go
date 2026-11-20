@@ -28,6 +28,13 @@ func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { /
 				log.Printf("Error stepping raft node: %v", err)
 			}
 		case rd := <-rn.Node.Ready(): // Raft 节点有 Ready 状态，处理 Ready
+			// 更新 leaderID 字段
+			if rd.SoftState != nil {
+				rn.mu.Lock()
+				rn.leaderID = rd.SoftState.Lead
+				rn.mu.Unlock()
+			}
+
 			// 1. 优先保存快照
 			if !raft.IsEmptySnap(rd.Snapshot) {
 				// 存到独立的 .snap 文件
