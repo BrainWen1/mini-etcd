@@ -2,7 +2,6 @@ package raftnode
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"log"
 	"time"
@@ -12,6 +11,11 @@ import (
 
 // Run 启动核心循环
 func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { // stopc 为只读 channel，接收停止信号
+	defer close(rn.stopc) // 退出时唤醒所有还在等待 ReadIndex 的请求
+
+	// 读请求聚合循环：把并发 GET 合并成一次 Raft ReadIndex，避免每个读都触发一轮心跳广播
+	go rn.readIndexLoop()
+
 	ticker := time.NewTicker(tickerInterval)
 	defer ticker.Stop()
 
@@ -72,10 +76,15 @@ func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { /
 			rn.trans.Send(rd.Messages)
 
 			// 4. 应用
+			// Apply 在一批日志全部落盘成功后才返回 nil；失败时整批回滚，状态机仍停在
+			// 上一批的最后一条。此时绝不能推进 appliedIndex：否则 ReadIndex 会把尚未
+			// 落盘的数据当成已应用返回给客户端。继续运行也无法自愈（这批 Ready 已被
+			// 消费，Raft 不会重发），只能按致命错误终止，等重启后从 consistentIndex 重放。
 			if len(rd.CommittedEntries) > 0 {
 				err := rn.applier.Apply(rd.CommittedEntries)
 				if err != nil {
-					log.Printf("Error applying committed entries: %v", err)
+					rn.storage.Close() // 关闭 WAL 文件，释放资源
+					log.Fatalf("apply committed entries failed: %v", err)
 				}
 
 				// 判断是否需要触发快照
@@ -137,22 +146,27 @@ func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { /
 					log.Printf(">>> 忽略非法 ReadIndex RequestCtx, 长度: %d", len(rs.RequestCtx))
 					continue
 				}
-				key := string(rs.RequestCtx)
-				seq := binary.BigEndian.Uint64(rs.RequestCtx[8:])
-
-				if rn.appliedIndex >= rs.Index {
-					// 已经追平，唤醒等待方，通知上层可以安全读取最新数据
-					log.Printf(">>> ReadIndex 追平, reqID: %d, applied index: %d, read index: %d", seq, rn.appliedIndex, rs.Index)
-					rn.resolveReadIndexLocked(key)
+				batch, ok := rn.readBatches[string(rs.RequestCtx)] // 通过 RequestCtx 找到对应的批次
+				if !ok {
+					// 批次已经因为超时被清理，迟到的 ReadState 直接丢弃
+					continue
+				}
+				if !batch.respondedOK { // 只处理第一次收到的 ReadState，避免重复处理
+					batch.respondedOK = true // 标记本批次已经收到 ReadState，避免重复处理
+					batch.target = rs.Index  // 记录本次 ReadIndex 返回的索引
+					close(batch.responded)   // 通知 readIndexLoop 可以收集下一批了
+				}
+				if rn.appliedIndex >= batch.target {
+					// 已经追平，放行批次里的所有读请求
+					rn.resolveReadIndexLocked(string(rs.RequestCtx))
 				} else {
-					// 还没追平，记下目标索引，等后续 Ready 里状态机追上再唤醒
-					log.Printf(">>> ReadIndex 未追平, reqID: %d, applied index: %d, read index: %d", seq, rn.appliedIndex, rs.Index)
-					rn.readIndexWaiters[key] = rs.Index
+					log.Printf(">>> ReadIndex 未追平, 请求数: %d, applied index: %d, read index: %d",
+						batch.count, rn.appliedIndex, batch.target)
 				}
 			}
-			// 复查此前挂起的 waiter：本轮应用可能刚好把它们的目标索引追平
-			for key, targetIndex := range rn.readIndexWaiters {
-				if rn.appliedIndex >= targetIndex {
+			// 本轮应用可能刚好让之前挂起的批次追平
+			for key, batch := range rn.readBatches {
+				if batch.respondedOK && rn.appliedIndex >= batch.target {
 					rn.resolveReadIndexLocked(key)
 				}
 			}

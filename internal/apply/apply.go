@@ -46,8 +46,21 @@ func (a *Applier) RemoveWaiter(requestID string) {
 	a.waiters.Delete(requestID)
 }
 
-// Apply 应用已提交的日志条目到状态机
+// Apply 应用已提交的日志条目到状态机。
+//
+// 本批所有可应用的日志会合并进同一个 bbolt 事务（见 MVCC.ApplyBatch），
+// 一批日志只落盘一次，而不是每条日志一次 fsync。
+// 副作用是通知客户端必须推迟到整批提交成功之后：否则提交失败时客户端已经收到了成功。
 func (a *Applier) Apply(entries []raftpb.Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	var (
+		batch   []mvcc.Entry // 本批待应用的日志
+		waiters []string     // 本批提交成功后才通知的 requestID
+	)
+
 	for _, entry := range entries {
 		// 忽略空日志和配置变更日志，只处理普通业务日志
 		if entry.Type != raftpb.EntryNormal || len(entry.Data) == 0 {
@@ -61,7 +74,6 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 			log.Printf("[apply] 无法解析的日志索引: %d, 数据: %q\n", entry.Index, string(entry.Data))
 			continue
 		}
-		log.Printf("[apply] 日志索引: %d, 操作: %s\n", entry.Index, cmdType.Op)
 
 		switch cmdType.Op {
 		case "PUT": // 处理 PUT 命令
@@ -71,15 +83,8 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 				a.notifyWaiter(cmdType.RequestID, fmt.Errorf("无法解析的 PUT 命令"))
 				continue
 			}
-			// 写状态机失败不能吞掉：否则可能日志里显示成功应用，但数据实际没落盘
-			err := a.mvccStorage.Put(cmd.Key, cmd.Value, entry.Index)
-			// 无论成功还是失败，都要通知等待的客户端
-			a.notifyWaiter(cmd.RequestID, err)
-			if err != nil {
-				log.Printf("[apply] 应用数据失败: %s -> %s, request ID: %s, 错误: %v\n", cmd.Key, cmd.Value, cmd.RequestID, err)
-				return err
-			}
-			log.Printf("[apply] 成功应用数据: %s -> %s, request ID: %s\n", cmd.Key, cmd.Value, cmd.RequestID)
+			batch = append(batch, mvcc.Entry{Index: entry.Index, Op: "PUT", Key: cmd.Key, Value: cmd.Value})
+			waiters = append(waiters, cmd.RequestID)
 		case "DELETE": // 处理 DELETE 命令
 			cmd, ok := types.DecodeCommand(entry.Data)
 			if !ok {
@@ -87,39 +92,52 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 				a.notifyWaiter(cmdType.RequestID, fmt.Errorf("无法解析的 DELETE 命令"))
 				continue
 			}
-			err := a.mvccStorage.Delete(cmd.Key, entry.Index)
-			a.notifyWaiter(cmd.RequestID, err)
-			if err != nil {
-				log.Printf("[apply] 删除数据失败: %s, request ID: %s, 错误: %v\n", cmd.Key, cmd.RequestID, err)
-				return err
-			}
-			log.Printf("[apply] 成功删除数据: %s, request ID: %s\n", cmd.Key, cmd.RequestID)
+			batch = append(batch, mvcc.Entry{Index: entry.Index, Op: "DELETE", Key: cmd.Key})
+			waiters = append(waiters, cmd.RequestID)
 		case "TXN": // 处理事务命令
 			txnCmd, err := types.DecodeTxnCommand(entry.Data)
 			if err != nil {
 				// 命令已经进了日志，无法回滚；至少要唤醒等待者，避免客户端干等到超时。
-				// 不返回错误：与未知命令一致，跳过这条日志，后续写入会推进 consistentIndex。
+				// 与未知命令一致：跳过这条日志，后续写入会推进 consistentIndex。
 				// 注意必须用信封里的 RequestID：解析失败时 txnCmd 是零值，RequestID 为空，
 				// notifyWaiter 会直接返回，客户端只能等到 5 秒超时。
 				log.Printf("[apply] 解析事务命令失败, 索引: %d, request ID: %s, 错误: %v\n", entry.Index, cmdType.RequestID, err)
 				a.notifyWaiter(cmdType.RequestID, err)
 				continue
 			}
-
-			err = a.mvccStorage.Txn(txnCmd, entry.Index)
-			a.notifyWaiter(txnCmd.RequestID, err)
-			if err != nil {
-				log.Printf("[apply] 应用事务失败, 索引: %d, request ID: %s, 错误: %v\n", entry.Index, txnCmd.RequestID, err)
-				return err
+			// 在进入批次之前校验：非法事务只跳过这一条，而不是让整批回滚。
+			// 校验结果是确定性的，所有节点都会跳过同一条日志，不会造成状态机分歧；
+			// 正常路径下 Server 已经校验过，这里是针对旧/损坏日志的兜底。
+			if err := types.ValidateTxnCommand(txnCmd); err != nil {
+				log.Printf("[apply] 非法事务, 索引: %d, request ID: %s, 错误: %v\n", entry.Index, txnCmd.RequestID, err)
+				a.notifyWaiter(txnCmd.RequestID, err)
+				continue
 			}
-			log.Printf("[apply] 成功应用事务, 索引: %d, request ID: %s, compares: %d, success: %d, failure: %d\n",
-				entry.Index, txnCmd.RequestID, len(txnCmd.Compares), len(txnCmd.Success), len(txnCmd.Failure))
+			batch = append(batch, mvcc.Entry{Index: entry.Index, Op: "TXN", Txn: txnCmd})
+			waiters = append(waiters, txnCmd.RequestID)
 		default:
 			// 未知命令也要唤醒客户端，否则客户端只能等到 5 秒超时
 			err := fmt.Errorf("unknown command: %s", cmdType.Op)
 			a.notifyWaiter(cmdType.RequestID, err)
 			log.Printf("[apply] 未知命令: %s, request ID: %s\n", cmdType.Op, cmdType.RequestID)
 		}
+	}
+
+	if len(batch) > 0 {
+		if err := a.mvccStorage.ApplyBatch(batch); err != nil {
+			// 整批已经回滚，这一批里的客户端一个都不能收到成功
+			for _, id := range waiters {
+				a.notifyWaiter(id, err)
+			}
+			log.Printf("[apply] 应用日志失败, 索引: %d-%d, 错误: %v\n", batch[0].Index, batch[len(batch)-1].Index, err)
+			return err
+		}
+		log.Printf("[apply] 已应用 %d 条日志, 索引: %d-%d\n", len(batch), batch[0].Index, batch[len(batch)-1].Index)
+	}
+
+	// 整批提交成功之后才通知客户端
+	for _, id := range waiters {
+		a.notifyWaiter(id, nil)
 	}
 	return nil
 }

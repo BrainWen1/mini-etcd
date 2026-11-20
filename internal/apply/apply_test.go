@@ -115,38 +115,44 @@ func TestApplyUnparseableTxnNotifiesWaiter(t *testing.T) {
 	}
 }
 
-// TestApplyInvalidTxnRollsBack 验证事务执行失败时整条事务回滚，
-// 并唤醒等待者；后续日志仍然可以正常应用。
-func TestApplyInvalidTxnRollsBack(t *testing.T) {
+// TestApplyInvalidTxnSkipped 验证非法事务只被跳过并唤醒等待者，
+// 不会写入数据，也不会阻断同一批次里的其它正常日志。
+//
+// 一批日志现在共用一个 bbolt 事务（见 MVCC.ApplyBatch）。如果把非法事务交给
+// 存储层执行，失败会让整批回滚，连带丢掉同一批里已经成功的写；所以在进入批次
+// 之前先校验，非法事务只跳过自己。
+func TestApplyInvalidTxnSkipped(t *testing.T) {
 	a := newTestApplier(t)
 
-	// DecodeTxnCommand 能解析，但比较运算符不受支持，MVCC.Txn 会返回错误。
+	// DecodeTxnCommand 能解析，但比较运算符不受支持。
 	data := []byte(`{"request_id":"bad-2","op":"TXN","compares":[{"key":"k","op":"~=","value":"v"}],"success":[{"op":"PUT","key":"a","value":"1"}]}`)
-	waitCh := a.RegisterWaiter("bad-2")
-
-	if err := a.Apply([]raftpb.Entry{{Index: 1, Type: raftpb.EntryNormal, Data: data}}); err == nil {
-		t.Fatal("Apply(invalid txn) = nil, want error")
-	}
-	select {
-	case err := <-waitCh:
-		if err == nil {
-			t.Fatal("执行失败的事务应通知等待者错误")
-		}
-	default:
-		t.Fatal("执行失败的事务没有通知等待者")
-	}
-	if _, ok := a.Get("a"); ok {
-		t.Fatal("失败的事务不应写入数据")
-	}
-
-	// 失败日志没有推进 consistentIndex，但不应阻塞后续正常日志
 	put, err := types.EncodePutCommand("next", "b", "2")
 	if err != nil {
 		t.Fatalf("EncodePutCommand: %v", err)
 	}
-	if err := a.Apply([]raftpb.Entry{{Index: 2, Type: raftpb.EntryNormal, Data: put}}); err != nil {
-		t.Fatalf("Apply(next): %v", err)
+	waitCh := a.RegisterWaiter("bad-2")
+
+	// 非法事务和一条正常 PUT 在同一个 Ready 里
+	entries := []raftpb.Entry{
+		{Index: 1, Type: raftpb.EntryNormal, Data: data},
+		{Index: 2, Type: raftpb.EntryNormal, Data: put},
 	}
+	if err := a.Apply(entries); err != nil {
+		t.Fatalf("Apply(batch with invalid txn) = %v, want nil（跳过该条日志）", err)
+	}
+	select {
+	case err := <-waitCh:
+		if err == nil {
+			t.Fatal("非法事务应通知等待者错误")
+		}
+	default:
+		t.Fatal("非法事务没有通知等待者")
+	}
+	if _, ok := a.Get("a"); ok {
+		t.Fatal("非法事务不应写入数据")
+	}
+
+	// 同一批次里的正常日志不受影响
 	if got, _ := a.Get("b"); got != "2" {
 		t.Fatalf("b = %q, want 2", got)
 	}
@@ -156,6 +162,68 @@ func TestApplyInvalidTxnRollsBack(t *testing.T) {
 	}
 	if idx != 2 {
 		t.Fatalf("GetConsistentIndex() = %d, want 2", idx)
+	}
+}
+
+// TestApplyBatchNotifiesOnlyAfterCommit 验证一批日志里的等待者都会在整批提交后
+// 收到通知，并且 PUT / DELETE / TXN 混合的一批日志按顺序全部生效。
+func TestApplyBatchNotifiesOnlyAfterCommit(t *testing.T) {
+	a := newTestApplier(t)
+
+	put1, _ := types.EncodePutCommand("put-1", "a", "1")
+	put2, _ := types.EncodePutCommand("put-2", "b", "2")
+	del, _ := types.EncodeDeleteCommand("del-1", "a")
+	txnData, err := types.EncodeTxnCommand(types.TxnCommand{
+		RequestID: "txn-1",
+		Compares:  []types.Compare{{Key: "b", Op: "==", Value: "2"}},
+		Success:   []types.Operation{{Op: "PUT", Key: "c", Value: "3"}},
+	})
+	if err != nil {
+		t.Fatalf("EncodeTxnCommand: %v", err)
+	}
+
+	waiters := map[string]chan error{
+		"put-1": a.RegisterWaiter("put-1"),
+		"put-2": a.RegisterWaiter("put-2"),
+		"del-1": a.RegisterWaiter("del-1"),
+		"txn-1": a.RegisterWaiter("txn-1"),
+	}
+	entries := []raftpb.Entry{
+		{Index: 1, Type: raftpb.EntryNormal, Data: put1},
+		{Index: 2, Type: raftpb.EntryNormal, Data: put2},
+		{Index: 3, Type: raftpb.EntryNormal, Data: del},
+		{Index: 4, Type: raftpb.EntryNormal, Data: txnData},
+	}
+	if err := a.Apply(entries); err != nil {
+		t.Fatalf("Apply(batch): %v", err)
+	}
+
+	for id, ch := range waiters {
+		select {
+		case err := <-ch:
+			if err != nil {
+				t.Fatalf("waiter %s got error %v, want nil", id, err)
+			}
+		default:
+			t.Fatalf("waiter %s 没有被通知", id)
+		}
+	}
+
+	if _, ok := a.Get("a"); ok {
+		t.Fatal("a 应已被删除")
+	}
+	if got, _ := a.Get("b"); got != "2" {
+		t.Fatalf("b = %q, want 2", got)
+	}
+	if got, _ := a.Get("c"); got != "3" {
+		t.Fatalf("c = %q, want 3", got)
+	}
+	idx, err := a.GetConsistentIndex()
+	if err != nil {
+		t.Fatalf("GetConsistentIndex: %v", err)
+	}
+	if idx != 4 {
+		t.Fatalf("GetConsistentIndex() = %d, want 4", idx)
 	}
 }
 

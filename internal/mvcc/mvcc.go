@@ -30,60 +30,105 @@ func NewMVCC(be *backend.Backend) *MVCC {
 // Put 写入数据和 appliedIndex（同一事务）
 func (m *MVCC) Put(key, value string, appliedIndex uint64) error {
 	return m.be.Update(func(tx backend.WriteTx) error {
-		// 1. 先做幂等检查：appliedIndex 小于等于当前 consistentIndex，说明这条日志
-		//    之前已经应用过（重启重放、快照回放等），整条日志都必须跳过。
-		//    注意顺序：一定不能先写业务数据再判断，否则重放旧日志会把新值覆盖成旧值。
-		var currentIdx uint64 = 0 // 默认值为 0，表示还没有应用过任何日志
-		currentIdxBytes := tx.Get(backend.MetaBucket, []byte(backend.ConsistentIndexKey))
-		if len(currentIdxBytes) == 8 { // len(nil slice) == 0，这里既判断了 nil 也判断了长度不够的情况
-			// 只有能从 metaBucket 中读到 currentIdx 才能把 Get 到的值赋给 currentIdx，否则 currentIdx 仍然是 0
-			currentIdx = binary.BigEndian.Uint64(currentIdxBytes)
-		}
-		// 不管 currentIdx 是默认值 0 还是从 metaBucket 中读到的值，都要和 appliedIndex 做比较，保证幂等性
-		if appliedIndex <= currentIdx {
-			log.Printf("[mvcc] Put: appliedIndex %d <= current consistentIndex %d, skipping duplicate entry\n", appliedIndex, currentIdx)
-			return nil
-		}
+		return applyPut(tx, key, value, appliedIndex)
+	})
+}
 
-		// 2. 更新全局 revision
-		var currentRev uint64 = 0 // 默认值为 0，表示还没有写入过任何数据
-		currentRevBytes := tx.Get(backend.MetaBucket, []byte(backend.RevisionKey))
-		if len(currentRevBytes) == 8 { // 这里同样也同时覆盖了 nil 和长度不够的情况
-			currentRev = binary.BigEndian.Uint64(currentRevBytes) // 存在的话赋值给 currentRev
-		}
-		// 同样不管 currentRev 是默认值 0 还是从 metaBucket 中读到的值，都要自增
-		currentRev++ // 每次写入数据时，revision 自增
-		revBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(revBytes, currentRev)
-		if err := tx.Put(backend.MetaBucket, []byte(backend.RevisionKey), revBytes); err != nil { // 把自增后的 revision 写回 metaBucket
-			log.Printf("Failed to update revision: %v", err)
-			return err
-		}
+// Entry 是一条已完成解码、待应用到状态机的日志。
+// Op 取值为 "PUT"、"DELETE" 或 "TXN"：PUT/DELETE 使用 Key/Value，TXN 使用 Txn。
+type Entry struct {
+	Index uint64
+	Op    string
+	Key   string
+	Value string
+	Txn   types.TxnCommand // 可选字段：仅当 Op="TXN" 时使用，表示事务命令
+}
 
-		// 3. 写入 Data 桶，key + revision 作为唯一标识，保证同一个 key 的不同版本可以共存
-		keyBytes := backend.GetKeyWithRevision(key, currentRev)
-		if err := tx.Put(backend.DataBucket, keyBytes, []byte(value)); err != nil {
-			log.Printf("Failed to put key %s: %v", key, err)
-			return err
+// ApplyBatch 在同一个 bbolt 事务里按顺序应用一批已提交日志。
+//
+// 每条日志单独开启一次写事务意味着一批日志要付出同样多次 fsync，批量应用把整批
+// 日志的落盘成本压缩成一次。整批要么全部生效、要么全部回滚，因此调用方必须等
+// 本方法成功返回之后才能通知客户端写入成功。
+func (m *MVCC) ApplyBatch(entries []Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	return m.be.Update(func(tx backend.WriteTx) error { // 在同一个 bbolt 事务里应用整批日志
+		for _, e := range entries {
+			var err error
+			switch e.Op {
+			case "PUT":
+				err = applyPut(tx, e.Key, e.Value, e.Index)
+			case "DELETE":
+				err = applyPut(tx, e.Key, string(TombstoneValue), e.Index)
+			case "TXN":
+				err = applyTxn(tx, e.Txn, e.Index)
+			default:
+				err = fmt.Errorf("mvcc: unsupported entry op %q", e.Op)
+			}
+			if err != nil {
+				return err
+			}
 		}
-
-		// 4. 更新 DataRevision 桶，记录每个 key 的最新 revision，方便 Get 时获取最新值
-		if err := tx.Put(backend.DataRevisionBucket, []byte(key), revBytes); err != nil {
-			log.Printf("Failed to update DataRevision for key %s: %v", key, err)
-			return err
-		}
-
-		// 5. 把 uint64 的 appliedIndex 转成 8 字节的 []byte，和数据在同一事务里更新，
-		//    保证 [数据 + 索引] 原子落盘，不会出现数据写了但索引没写的情况
-		idxBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(idxBytes, appliedIndex)
-		if err := tx.Put(backend.MetaBucket, []byte(backend.ConsistentIndexKey), idxBytes); err != nil {
-			log.Printf("Failed to update consistent index: %v", err)
-			return err
-		}
-
 		return nil
 	})
+}
+
+// applyPut 在给定事务内写入一条 KV，并推进 consistentIndex
+func applyPut(tx backend.WriteTx, key, value string, appliedIndex uint64) error {
+	// 1. 先做幂等检查：appliedIndex 小于等于当前 consistentIndex，说明这条日志
+	//    之前已经应用过（重启重放、快照回放等），整条日志都必须跳过。
+	//    注意顺序：一定不能先写业务数据再判断，否则重放旧日志会把新值覆盖成旧值。
+	var currentIdx uint64 = 0 // 默认值为 0，表示还没有应用过任何日志
+	currentIdxBytes := tx.Get(backend.MetaBucket, []byte(backend.ConsistentIndexKey))
+	if len(currentIdxBytes) == 8 { // len(nil slice) == 0，这里既判断了 nil 也判断了长度不够的情况
+		// 只有能从 metaBucket 中读到 currentIdx 才能把 Get 到的值赋给 currentIdx，否则 currentIdx 仍然是 0
+		currentIdx = binary.BigEndian.Uint64(currentIdxBytes)
+	}
+	// 不管 currentIdx 是默认值 0 还是从 metaBucket 中读到的值，都要和 appliedIndex 做比较，保证幂等性
+	if appliedIndex <= currentIdx {
+		log.Printf("[mvcc] Put: appliedIndex %d <= current consistentIndex %d, skipping duplicate entry\n", appliedIndex, currentIdx)
+		return nil
+	}
+
+	// 2. 更新全局 revision
+	var currentRev uint64 = 0 // 默认值为 0，表示还没有写入过任何数据
+	currentRevBytes := tx.Get(backend.MetaBucket, []byte(backend.RevisionKey))
+	if len(currentRevBytes) == 8 { // 这里同样也同时覆盖了 nil 和长度不够的情况
+		currentRev = binary.BigEndian.Uint64(currentRevBytes) // 存在的话赋值给 currentRev
+	}
+	// 同样不管 currentRev 是默认值 0 还是从 metaBucket 中读到的值，都要自增
+	currentRev++ // 每次写入数据时，revision 自增
+	revBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(revBytes, currentRev)
+	if err := tx.Put(backend.MetaBucket, []byte(backend.RevisionKey), revBytes); err != nil { // 把自增后的 revision 写回 metaBucket
+		log.Printf("Failed to update revision: %v", err)
+		return err
+	}
+
+	// 3. 写入 Data 桶，key + revision 作为唯一标识，保证同一个 key 的不同版本可以共存
+	keyBytes := backend.GetKeyWithRevision(key, currentRev)
+	if err := tx.Put(backend.DataBucket, keyBytes, []byte(value)); err != nil {
+		log.Printf("Failed to put key %s: %v", key, err)
+		return err
+	}
+
+	// 4. 更新 DataRevision 桶，记录每个 key 的最新 revision，方便 Get 时获取最新值
+	if err := tx.Put(backend.DataRevisionBucket, []byte(key), revBytes); err != nil {
+		log.Printf("Failed to update DataRevision for key %s: %v", key, err)
+		return err
+	}
+
+	// 5. 把 uint64 的 appliedIndex 转成 8 字节的 []byte，和数据在同一事务里更新，
+	//    保证 [数据 + 索引] 原子落盘，不会出现数据写了但索引没写的情况
+	idxBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(idxBytes, appliedIndex)
+	if err := tx.Put(backend.MetaBucket, []byte(backend.ConsistentIndexKey), idxBytes); err != nil {
+		log.Printf("Failed to update consistent index: %v", err)
+		return err
+	}
+
+	return nil
 }
 
 // Get 获取指定 key 的最新值，如果 key 不存在则返回 ErrKeyNotFound
@@ -400,78 +445,83 @@ func (m *MVCC) Range(prefix string, limit int) ([]KVPair, error) {
 // 条件判断和分支内的写入必须原子完成：否则并发读可能看到"条件已满足"却还没写入的中间状态。
 func (m *MVCC) Txn(txnCmd types.TxnCommand, appliedIndex uint64) error {
 	return m.be.Update(func(tx backend.WriteTx) error {
-		// 1. 幂等检查（与 Put 相同）：重放旧日志时整条事务都必须跳过
-		var currentIdx uint64 = 0
-		currentIdxBytes := tx.Get(backend.MetaBucket, []byte(backend.ConsistentIndexKey))
-		if len(currentIdxBytes) == 8 {
-			currentIdx = binary.BigEndian.Uint64(currentIdxBytes)
+		return applyTxn(tx, txnCmd, appliedIndex)
+	})
+}
+
+// applyTxn 在给定事务内执行一条事务日志
+func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) error {
+	// 1. 幂等检查（与 Put 相同）：重放旧日志时整条事务都必须跳过
+	var currentIdx uint64 = 0
+	currentIdxBytes := tx.Get(backend.MetaBucket, []byte(backend.ConsistentIndexKey))
+	if len(currentIdxBytes) == 8 {
+		currentIdx = binary.BigEndian.Uint64(currentIdxBytes)
+	}
+	if appliedIndex <= currentIdx {
+		return nil // 重复应用，直接跳过
+	}
+
+	// 2. 评估所有 If 条件（多个条件之间是 AND）。
+	//    key 不存在时按空串比较，与 etcd 语义一致。
+	allMatched := true
+	for _, cmp := range txnCmd.Compares {
+		actualVal, _ := getTxValue(tx, cmp.Key)
+		matched, err := cmp.Match(actualVal)
+		if err != nil {
+			return fmt.Errorf("txn compare %q: %w", cmp.Key, err)
 		}
-		if appliedIndex <= currentIdx {
-			return nil // 重复应用，直接跳过
+		if !matched {
+			allMatched = false
+			break
 		}
+	}
 
-		// 2. 评估所有 If 条件（多个条件之间是 AND）。
-		//    key 不存在时按空串比较，与 etcd 语义一致。
-		allMatched := true
-		for _, cmp := range txnCmd.Compares {
-			actualVal, _ := getTxValue(tx, cmp.Key)
-			matched, err := cmp.Match(actualVal)
-			if err != nil {
-				return fmt.Errorf("txn compare %q: %w", cmp.Key, err)
-			}
-			if !matched {
-				allMatched = false
-				break
-			}
-		}
+	// 3. 决定执行哪个分支
+	ops := txnCmd.Failure
+	if allMatched {
+		ops = txnCmd.Success
+	}
 
-		// 3. 决定执行哪个分支
-		ops := txnCmd.Failure
-		if allMatched {
-			ops = txnCmd.Success
-		}
+	// 4. 执行分支里的每一个操作
+	var currentRev uint64 = 0
+	revBytes := tx.Get(backend.MetaBucket, []byte(backend.RevisionKey))
+	if len(revBytes) == 8 {
+		currentRev = binary.BigEndian.Uint64(revBytes)
+	}
 
-		// 4. 执行分支里的每一个操作
-		var currentRev uint64 = 0
-		revBytes := tx.Get(backend.MetaBucket, []byte(backend.RevisionKey))
-		if len(revBytes) == 8 {
-			currentRev = binary.BigEndian.Uint64(revBytes)
-		}
-
-		for _, op := range ops {
-			var valToWrite []byte
-			switch op.Op {
-			case "PUT":
-				valToWrite = []byte(op.Value)
-			case "DELETE":
-				valToWrite = TombstoneValue
-			default:
-				// 正常路径下 Server 已经校验过；这里兜底，避免把非法操作当成空值写入。
-				return fmt.Errorf("txn: unsupported operation %q", op.Op)
-			}
-
-			currentRev++ // 事务内的每个写操作，Revision 都加 1
-
-			// 写入 DataBucket
-			keyWithRev := backend.GetKeyWithRevision(op.Key, currentRev)
-			if err := tx.Put(backend.DataBucket, keyWithRev, valToWrite); err != nil {
-				return err
-			}
-
-			// 更新 DataRevisionBucket
-			opRevBytes := make([]byte, 8)
-			binary.BigEndian.PutUint64(opRevBytes, currentRev)
-			if err := tx.Put(backend.DataRevisionBucket, []byte(op.Key), opRevBytes); err != nil {
-				return err
-			}
+	for _, op := range ops {
+		var valToWrite []byte
+		switch op.Op {
+		case "PUT":
+			valToWrite = []byte(op.Value)
+		case "DELETE":
+			valToWrite = TombstoneValue
+		default:
+			// 正常路径下 Server 已经校验过；这里兜底，避免把非法操作当成空值写入。
+			return fmt.Errorf("txn: unsupported operation %q", op.Op)
 		}
 
-		// 5. 更新全局 Revision 和 AppliedIndex（同一事务，保证原子落盘）
-		if err := putMetaUint64(tx, backend.RevisionKey, currentRev); err != nil {
+		currentRev++ // 事务内的每个写操作，Revision 都加 1
+
+		// 写入 DataBucket
+		keyWithRev := backend.GetKeyWithRevision(op.Key, currentRev)
+		if err := tx.Put(backend.DataBucket, keyWithRev, valToWrite); err != nil {
 			return err
 		}
-		return putMetaUint64(tx, backend.ConsistentIndexKey, appliedIndex)
-	})
+
+		// 更新 DataRevisionBucket
+		opRevBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(opRevBytes, currentRev)
+		if err := tx.Put(backend.DataRevisionBucket, []byte(op.Key), opRevBytes); err != nil {
+			return err
+		}
+	}
+
+	// 5. 更新全局 Revision 和 AppliedIndex（同一事务，保证原子落盘）
+	if err := putMetaUint64(tx, backend.RevisionKey, currentRev); err != nil {
+		return err
+	}
+	return putMetaUint64(tx, backend.ConsistentIndexKey, appliedIndex)
 }
 
 // getTxValue 在同一个 bbolt 事务内读取 key 的最新值。
