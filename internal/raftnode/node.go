@@ -1,6 +1,7 @@
 package raftnode
 
 import (
+	"encoding/binary"
 	"log"
 	"mini-etcd/internal/config"
 	"slices"
@@ -49,6 +50,29 @@ type RaftNode struct {
 
 	leaderID uint64       // 当前节点认为的 Leader ID
 	mu       sync.RWMutex // 保护 leaderID 的读写锁
+
+	// readIndexChannels / readIndexWaiters 的 key 是 ReadIndex 的 RequestCtx（由 ReadIndexKey 生成），
+	// 必须和传给 Node.ReadIndex 的字节完全一致，Raft 才能把 ReadState 对回本地 waiter。
+	readIndexChannels map[string]chan struct{} // ReadIndex waiter 的通知 channel
+	readIndexWaiters  map[string]uint64        // 尚未追平目标的 ReadIndex waiter -> 目标索引
+	readIndexMu       sync.Mutex               // 保护 readIndexChannels 和 readIndexWaiters
+	appliedIndex      uint64                   // 状态机当前已应用的最高日志索引
+}
+
+// readIndexKeyLen 是 ReadIndexKey 生成的 RequestCtx 长度：8 字节节点 ID + 8 字节进程内序号。
+const readIndexKeyLen = 16
+
+// ReadIndexKey 构造 ReadIndex 请求的 RequestCtx。
+//
+// etcd/raft 的 readOnly 用 RequestCtx 的字节串作为 pendingReadIndex 的 key 去重，
+// 并把它原样回显到 MsgReadIndexResp。如果只用节点内自增序号，不同 follower 发往同一个
+// Leader 的并发读请求会撞到同一个 key：后到的请求被静默丢弃，既不进队列也收不到响应，
+// 对应的 GET 只能等到超时。把节点 ID 编进 key 才能保证集群范围内唯一。
+func ReadIndexKey(nodeID, seq uint64) string {
+	buf := make([]byte, readIndexKeyLen)
+	binary.BigEndian.PutUint64(buf[:8], nodeID)
+	binary.BigEndian.PutUint64(buf[8:], seq)
+	return string(buf)
 }
 
 // NewRaftNode 创建一个新的 RaftNode 实例
@@ -159,6 +183,12 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 		lastSnapshotIndex: snap.Metadata.Index,
 		confState:         confState, // 使用从 Storage 中读取的 ConfState 初始化
 		leaderID:          0,         // 初始化为 0，表示尚未确定 Leader
+		readIndexChannels: make(map[string]chan struct{}),
+		readIndexWaiters:  make(map[string]uint64),
+		// 重启后状态机已经停在 consistentIndex，这里必须同步初始化：
+		// 否则 appliedIndex 从 0 开始，ReadIndex 会一直判定“未追平”，
+		// 而重启后不会再有 CommittedEntries 来推进它，follower 上的读只能等到超时。
+		appliedIndex: appliedIndex,
 	}
 }
 
@@ -174,4 +204,33 @@ func (rn *RaftNode) GetLeaderID() uint64 {
 	rn.mu.RLock()
 	defer rn.mu.RUnlock()
 	return rn.leaderID
+}
+
+// RegisterReadIndexWaiter 注册一个 ReadIndex waiter，返回一个 channel，当 Raft 追平 ReadIndex 时会关闭它。
+// key 必须是传给 Node.ReadIndex 的 RequestCtx（由 ReadIndexKey 生成）。
+// 必须先注册再调用 ReadIndex，否则 ReadState 可能先于注册到达，客户端只能等到超时。
+func (rn *RaftNode) RegisterReadIndexWaiter(key string) <-chan struct{} {
+	rn.readIndexMu.Lock()
+	defer rn.readIndexMu.Unlock()
+	ch := make(chan struct{})
+	rn.readIndexChannels[key] = ch
+	return ch
+}
+
+// RemoveReadIndexWaiter 移除一个 ReadIndex waiter，用于客户端超时或读取完成后清理。
+func (rn *RaftNode) RemoveReadIndexWaiter(key string) {
+	rn.readIndexMu.Lock()
+	defer rn.readIndexMu.Unlock()
+	delete(rn.readIndexChannels, key)
+	delete(rn.readIndexWaiters, key)
+}
+
+// resolveReadIndexLocked 唤醒并清理一个 ReadIndex waiter。调用方必须持有 readIndexMu。
+// 客户端可能已经超时并调用过 RemoveReadIndexWaiter，此时 channel 不存在，直接跳过。
+func (rn *RaftNode) resolveReadIndexLocked(key string) {
+	if ch, ok := rn.readIndexChannels[key]; ok {
+		close(ch) // 关闭而不是发送：状态机已追平，读方可以安全读取
+		delete(rn.readIndexChannels, key)
+	}
+	delete(rn.readIndexWaiters, key)
 }
