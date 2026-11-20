@@ -3,6 +3,7 @@ package httpapi
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -10,6 +11,7 @@ import (
 
 	"mini-etcd/internal/mvcc"
 	"mini-etcd/internal/server"
+	"mini-etcd/internal/types"
 )
 
 type HTTPServer struct {
@@ -30,6 +32,7 @@ func (h *HTTPServer) Start(port string) error {
 	mux.HandleFunc("GET /v1/kv/{key}", h.handleGet)
 	mux.HandleFunc("DELETE /v1/kv/{key}", h.handleDelete)
 	mux.HandleFunc("GET /v1/kv/range", h.handleRange)
+	mux.HandleFunc("POST /v1/kv/txn", h.handleTxn)
 
 	log.Printf("HTTP API Server 启动，监听 %s", port)
 	return http.ListenAndServe(":"+port, mux)
@@ -53,6 +56,32 @@ type RangeKV struct {
 
 type RangeResponse struct {
 	KVs []RangeKV `json:"kvs"`
+}
+
+// TxnRequest 是事务请求体。compares 之间是 AND 关系；
+// 条件全部成立时执行 success，否则执行 failure。
+type TxnRequest struct {
+	Compares []types.Compare   `json:"compares"`
+	Success  []types.Operation `json:"success"`
+	Failure  []types.Operation `json:"failure"`
+}
+
+// validateTxnKeys 对事务中所有 key 做与 PUT/DELETE 相同的校验：
+// \x00 会破坏存储层 "key\x00revision" 的组合键，NUL 经 URL/JSON 都能传进来。
+func validateTxnKeys(req TxnRequest) error {
+	for _, cmp := range req.Compares {
+		if err := validateKey(cmp.Key); err != nil {
+			return fmt.Errorf("compares: %w", err)
+		}
+	}
+	for _, ops := range [][]types.Operation{req.Success, req.Failure} {
+		for _, op := range ops {
+			if err := validateKey(op.Key); err != nil {
+				return fmt.Errorf("%s operation: %w", op.Op, err)
+			}
+		}
+	}
+	return nil
 }
 
 type ErrorResponse struct {
@@ -205,4 +234,40 @@ func (h *HTTPServer) handleRange(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// handleTxn 处理 POST /v1/kv/txn，例如：
+//
+//	{
+//	  "compares": [{"key": "k", "op": "==", "value": "v"}],
+//	  "success":  [{"op": "PUT", "key": "a", "value": "1"}],
+//	  "failure":  [{"op": "DELETE", "key": "b"}]
+//	}
+func (h *HTTPServer) handleTxn(w http.ResponseWriter, r *http.Request) {
+	var req TxnRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+
+	if err := validateTxnKeys(req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// 校验比较运算符和写操作类型：非法请求直接 400，不写进 Raft 日志
+	txnCmd := types.TxnCommand{Compares: req.Compares, Success: req.Success, Failure: req.Failure}
+	if err := types.ValidateTxnCommand(txnCmd); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// 调用底层的 HandleTxn（同步等待落盘）
+	if err := h.srv.HandleTxn(req.Compares, req.Success, req.Failure); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
 }

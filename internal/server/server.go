@@ -10,6 +10,7 @@ import (
 	"mini-etcd/internal/raftnode"
 	"mini-etcd/internal/storage"
 	"mini-etcd/internal/transport"
+	"mini-etcd/internal/types"
 	"sync/atomic"
 	"time"
 )
@@ -61,21 +62,21 @@ func (s *Server) Stop() {
 	s.trans.Close()
 }
 
-// HandlePut 处理客户端的 PUT 请求，提交给 Raft 提议
-func (s *Server) HandlePut(key, value string) error {
-	// 节点 ID + 自增序号，保证同一进程内唯一；跨节点也不会冲突
-	reqID := fmt.Sprintf("%d-%d", s.Cfg.ID, s.reqSeq.Add(1))
-	cmd, err := apply.EncodePutCommand(reqID, key, value)
-	if err != nil {
-		return fmt.Errorf("encode command failed: %w", err)
-	}
+// nextRequestID 生成进程内唯一的请求 ID：节点 ID + 自增序号。
+// 不能用 time.Now().UnixNano()：高并发下可能取到相同值，导致 waiter 的 key 冲突。
+func (s *Server) nextRequestID() string {
+	return fmt.Sprintf("%d-%d", s.Cfg.ID, s.reqSeq.Add(1))
+}
 
-	// 1. 先注册 waiter，拿到等待的 channel
+// proposeAndWait 把命令提交给 Raft，并阻塞等待状态机应用完成。
+// 调用方必须先用 nextRequestID 生成 reqID，并用同一个 reqID 编码命令。
+func (s *Server) proposeAndWait(reqID string, cmd []byte) error {
+	// 1. 先注册 waiter，再提交；顺序反过来的话 Apply 可能先于注册完成，客户端会一直等到超时
 	waitCh := s.Applier.RegisterWaiter(reqID)
 
 	// 2. 将请求提交给 Raft
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // 设置超时时间，防止阻塞
-	err = s.Rn.Node.Propose(ctx, cmd)
+	err := s.Rn.Node.Propose(ctx, cmd)
 	cancel() // 释放资源
 	if err != nil {
 		// 如果提议失败（比如超时或节点不是 Leader），要把 waiter 清理掉
@@ -92,6 +93,16 @@ func (s *Server) HandlePut(key, value string) error {
 		s.Applier.RemoveWaiter(reqID)
 		return errors.New("timeout waiting for apply")
 	}
+}
+
+// HandlePut 处理客户端的 PUT 请求，提交给 Raft 提议
+func (s *Server) HandlePut(key, value string) error {
+	reqID := s.nextRequestID()
+	cmd, err := types.EncodePutCommand(reqID, key, value)
+	if err != nil {
+		return fmt.Errorf("encode command failed: %w", err)
+	}
+	return s.proposeAndWait(reqID, cmd)
 }
 
 // HandleGet 处理客户端的 GET 请求，读取最新数据
@@ -108,35 +119,32 @@ func (s *Server) HandleGetAtRevision(key string, rev uint64) (string, error) {
 
 // HandleDelete 处理客户端的 DELETE 请求，提交给 Raft 提议
 func (s *Server) HandleDelete(key string) error {
-	// 节点 ID + 自增序号，保证同一进程内唯一；跨节点也不会冲突
-	reqID := fmt.Sprintf("%d-%d", s.Cfg.ID, s.reqSeq.Add(1))
-	cmd, err := apply.EncodeDeleteCommand(reqID, key)
+	reqID := s.nextRequestID()
+	cmd, err := types.EncodeDeleteCommand(reqID, key)
 	if err != nil {
 		return fmt.Errorf("encode command failed: %w", err)
 	}
+	return s.proposeAndWait(reqID, cmd)
+}
 
-	// 1. 先注册 waiter，拿到等待的 channel
-	waitCh := s.Applier.RegisterWaiter(reqID)
-
-	// 2. 将请求提交给 Raft
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // 设置超时时间，防止阻塞
-	err = s.Rn.Node.Propose(ctx, cmd)
-	cancel() // 释放资源
+// HandleTxn 处理客户端的 TXN 请求：提交事务命令，由状态机在 Apply 时
+// 在同一 bbolt 事务中评估 compares 并执行 success/failure 分支。
+func (s *Server) HandleTxn(compares []types.Compare, success, failure []types.Operation) error {
+	txnCmd := types.TxnCommand{
+		RequestID: s.nextRequestID(),
+		Compares:  compares,
+		Success:   success,
+		Failure:   failure,
+	}
+	// 写进 Raft 日志前先校验：非法命令一旦进入日志，每次重放都会失败
+	if err := types.ValidateTxnCommand(txnCmd); err != nil {
+		return fmt.Errorf("invalid txn: %w", err)
+	}
+	cmd, err := types.EncodeTxnCommand(txnCmd)
 	if err != nil {
-		// 如果提议失败（比如超时或节点不是 Leader），要把 waiter 清理掉
-		s.Applier.RemoveWaiter(reqID)
-		return fmt.Errorf("propose failed: %w", err)
+		return fmt.Errorf("encode command failed: %w", err)
 	}
-
-	// 3. 阻塞等待 Raft 应用结果
-	// 这里也要设置超时，防止 Raft 迟迟不 Apply
-	select {
-	case applyErr := <-waitCh:
-		return applyErr // 返回应用结果，可能是 nil 或者具体的错误
-	case <-time.After(5 * time.Second): // 超时兜底
-		s.Applier.RemoveWaiter(reqID)
-		return errors.New("timeout waiting for apply")
-	}
+	return s.proposeAndWait(txnCmd.RequestID, cmd)
 }
 
 // HandleRange 处理客户端的 RANGE 请求，读取指定范围的数据
