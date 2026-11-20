@@ -4,6 +4,7 @@ import (
 	"log"
 	"mini-etcd/internal/config"
 	"slices"
+	"sync"
 
 	"go.etcd.io/etcd/raft/v3"
 	"go.etcd.io/etcd/raft/v3/raftpb"
@@ -45,6 +46,9 @@ type RaftNode struct {
 
 	lastSnapshotIndex uint64           // 记录上一次快照的索引
 	confState         raftpb.ConfState // 记录当前集群的配置状态
+
+	leaderID uint64       // 当前节点认为的 Leader ID
+	mu       sync.RWMutex // 保护 leaderID 的读写锁
 }
 
 // NewRaftNode 创建一个新的 RaftNode 实例
@@ -154,6 +158,7 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 		applier:           applier,
 		lastSnapshotIndex: snap.Metadata.Index,
 		confState:         confState, // 使用从 Storage 中读取的 ConfState 初始化
+		leaderID:          0,         // 初始化为 0，表示尚未确定 Leader
 	}
 }
 
@@ -163,3 +168,10 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 // Ready 返回一个 channel，当 Raft 节点有 Ready 状态时会发送通知
 // Advance 通知 Raft 节点已经处理完 Ready 状态
 // Stop 停止 Raft 节点
+
+// GetLeaderID 返回当前节点认为的 Leader ID
+func (rn *RaftNode) GetLeaderID() uint64 {
+	rn.mu.RLock()
+	defer rn.mu.RUnlock()
+	return rn.leaderID
+}

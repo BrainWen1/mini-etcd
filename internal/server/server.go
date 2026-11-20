@@ -151,3 +151,18 @@ func (s *Server) HandleTxn(compares []types.Compare, success, failure []types.Op
 func (s *Server) HandleRange(prefix string, limit int) ([]mvcc.KVPair, error) {
 	return s.mvcc.Range(prefix, limit)
 }
+
+// IsLeader 返回当前节点是否是 Leader
+func (s *Server) IsLeader() bool {
+	leaderID := s.Rn.GetLeaderID()
+	return leaderID == s.Cfg.ID
+}
+
+// GetLeaderHTTPAddr 返回当前 Leader 的地址，如果没有 Leader 则返回空字符串
+func (s *Server) GetLeaderHTTPAddr() string {
+	leaderID := s.Rn.GetLeaderID()
+	if leaderID == 0 {
+		return ""
+	}
+	return s.Cfg.HTTPPeers[leaderID] // 返回 Leader 的 HTTP 地址
+}

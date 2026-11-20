@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"mini-etcd/internal/apply"
 	"mini-etcd/internal/backend"
@@ -13,6 +14,7 @@ import (
 	"mini-etcd/internal/transport"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -29,10 +31,10 @@ func main() {
 		2: "127.0.0.1:8002",
 		3: "127.0.0.1:8003",
 	}
-	httpPortMap := map[uint64]string{ // 用于启动 HTTP 服务，提供客户端访问接口，只需要知道端口号即可
-		1: "10001",
-		2: "10002",
-		3: "10003",
+	httpAddrMap := map[uint64]string{ // 用于启动 HTTP 服务，提供客户端访问接口，只需要知道端口号即可
+		1: "127.0.0.1:10001",
+		2: "127.0.0.1:10002",
+		3: "127.0.0.1:10003",
 	}
 
 	// 校验节点 ID：如果 ID 不在集群配置里，ListenAddr 会是空字符串，
@@ -42,13 +44,13 @@ func main() {
 	if !ok {
 		log.Fatalf("invalid -id %d: not found in cluster config (valid IDs: 1, 2, 3)", id)
 	}
-	httpPort, ok := httpPortMap[id]
-	if !ok {
-		log.Fatalf("no HTTP port configured for node %d", id)
+	httpPort, err := parseHTTPPort(httpAddrMap[id])
+	if err != nil {
+		log.Fatalf("no HTTP port configured for node %d: %v", id, err)
 	}
 
 	// 配置当前节点参数
-	cfg := config.Default(id, peersAddrMap)
+	cfg := config.Default(id, peersAddrMap, httpAddrMap)
 	cfg.ListenAddr = listenAddr
 	cfg.HTTPPort = httpPort
 
@@ -123,4 +125,14 @@ func main() {
 
 	// 停止服务
 	srv.Stop()
+}
+
+// parseHTTPPort 解析 HTTP 端口字符串，确保格式正确
+func parseHTTPPort(portStr string) (string, error) {
+	parts := strings.Split(portStr, ":") // 确保格式为 "host:port"
+	if len(parts) != 2 {
+		return "", fmt.Errorf("invalid HTTP port format: %s", portStr)
+	}
+
+	return parts[1], nil
 }
