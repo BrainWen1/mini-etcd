@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"mini-etcd/internal/backend"
+	"mini-etcd/internal/types"
 
 	"log"
 )
@@ -393,4 +394,105 @@ func (m *MVCC) Range(prefix string, limit int) ([]KVPair, error) {
 	})
 
 	return results, err
+}
+
+// Txn 在单个 bbolt 事务中评估 If 条件，并执行 Then/Else 分支。
+// 条件判断和分支内的写入必须原子完成：否则并发读可能看到"条件已满足"却还没写入的中间状态。
+func (m *MVCC) Txn(txnCmd types.TxnCommand, appliedIndex uint64) error {
+	return m.be.Update(func(tx backend.WriteTx) error {
+		// 1. 幂等检查（与 Put 相同）：重放旧日志时整条事务都必须跳过
+		var currentIdx uint64 = 0
+		currentIdxBytes := tx.Get(backend.MetaBucket, []byte(backend.ConsistentIndexKey))
+		if len(currentIdxBytes) == 8 {
+			currentIdx = binary.BigEndian.Uint64(currentIdxBytes)
+		}
+		if appliedIndex <= currentIdx {
+			return nil // 重复应用，直接跳过
+		}
+
+		// 2. 评估所有 If 条件（多个条件之间是 AND）。
+		//    key 不存在时按空串比较，与 etcd 语义一致。
+		allMatched := true
+		for _, cmp := range txnCmd.Compares {
+			actualVal, _ := getTxValue(tx, cmp.Key)
+			matched, err := cmp.Match(actualVal)
+			if err != nil {
+				return fmt.Errorf("txn compare %q: %w", cmp.Key, err)
+			}
+			if !matched {
+				allMatched = false
+				break
+			}
+		}
+
+		// 3. 决定执行哪个分支
+		ops := txnCmd.Failure
+		if allMatched {
+			ops = txnCmd.Success
+		}
+
+		// 4. 执行分支里的每一个操作
+		var currentRev uint64 = 0
+		revBytes := tx.Get(backend.MetaBucket, []byte(backend.RevisionKey))
+		if len(revBytes) == 8 {
+			currentRev = binary.BigEndian.Uint64(revBytes)
+		}
+
+		for _, op := range ops {
+			var valToWrite []byte
+			switch op.Op {
+			case "PUT":
+				valToWrite = []byte(op.Value)
+			case "DELETE":
+				valToWrite = TombstoneValue
+			default:
+				// 正常路径下 Server 已经校验过；这里兜底，避免把非法操作当成空值写入。
+				return fmt.Errorf("txn: unsupported operation %q", op.Op)
+			}
+
+			currentRev++ // 事务内的每个写操作，Revision 都加 1
+
+			// 写入 DataBucket
+			keyWithRev := backend.GetKeyWithRevision(op.Key, currentRev)
+			if err := tx.Put(backend.DataBucket, keyWithRev, valToWrite); err != nil {
+				return err
+			}
+
+			// 更新 DataRevisionBucket
+			opRevBytes := make([]byte, 8)
+			binary.BigEndian.PutUint64(opRevBytes, currentRev)
+			if err := tx.Put(backend.DataRevisionBucket, []byte(op.Key), opRevBytes); err != nil {
+				return err
+			}
+		}
+
+		// 5. 更新全局 Revision 和 AppliedIndex（同一事务，保证原子落盘）
+		if err := putMetaUint64(tx, backend.RevisionKey, currentRev); err != nil {
+			return err
+		}
+		return putMetaUint64(tx, backend.ConsistentIndexKey, appliedIndex)
+	})
+}
+
+// getTxValue 在同一个 bbolt 事务内读取 key 的最新值。
+// 第二个返回值表示 key 是否存在；不存在（或已被删除）时返回 ("", false)。
+func getTxValue(tx backend.WriteTx, key string) (string, bool) {
+	revBytes := tx.Get(backend.DataRevisionBucket, []byte(key))
+	if len(revBytes) != 8 {
+		return "", false
+	}
+	rev := binary.BigEndian.Uint64(revBytes)
+	keyWithRev := backend.GetKeyWithRevision(key, rev)
+	val := tx.Get(backend.DataBucket, keyWithRev)
+	if val == nil || bytes.Equal(val, TombstoneValue) {
+		return "", false
+	}
+	return string(val), true
+}
+
+// putMetaUint64 把 uint64 以 8 字节大端序写入 MetaBucket
+func putMetaUint64(tx backend.WriteTx, key string, val uint64) error {
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, val)
+	return tx.Put(backend.MetaBucket, []byte(key), buf)
 }

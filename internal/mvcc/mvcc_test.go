@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"mini-etcd/internal/backend"
+	"mini-etcd/internal/types"
 )
 
 func newTestMVCC(t *testing.T) *MVCC {
@@ -147,6 +148,181 @@ func TestSnapshotRoundTripBinaryRevision(t *testing.T) {
 
 // TestGetAtRevisionIgnoresOtherKeysWithNUL 验证用户 key 中包含 \x00 时，
 // GetAtRevision 不会把形如 "key\x00other" 的其它 key 的版本误当成自己的值返回。
+// TestTxnBranches 验证条件成立走 success、条件不成立走 failure。
+func TestTxnBranches(t *testing.T) {
+	m := newTestMVCC(t)
+	if err := m.Put("balance", "100", 1); err != nil {
+		t.Fatalf("Put(balance): %v", err)
+	}
+
+	txn := types.TxnCommand{
+		Op:       "TXN",
+		Compares: []types.Compare{{Key: "balance", Op: "==", Value: "100"}},
+		Success: []types.Operation{
+			{Op: "PUT", Key: "balance", Value: "90"},
+			{Op: "PUT", Key: "log", Value: "debit"},
+		},
+		Failure: []types.Operation{{Op: "PUT", Key: "log", Value: "skip"}},
+	}
+	if err := m.Txn(txn, 2); err != nil {
+		t.Fatalf("Txn(success branch): %v", err)
+	}
+	if got, _ := m.Get("balance"); got != "90" {
+		t.Fatalf("balance = %q, want 90", got)
+	}
+	if got, _ := m.Get("log"); got != "debit" {
+		t.Fatalf("log = %q, want debit", got)
+	}
+
+	// 条件不再成立（balance 已是 90），应走 failure 分支
+	txn.Compares[0].Value = "100"
+	if err := m.Txn(txn, 3); err != nil {
+		t.Fatalf("Txn(failure branch): %v", err)
+	}
+	if got, _ := m.Get("log"); got != "skip" {
+		t.Fatalf("log = %q, want skip", got)
+	}
+	if got, _ := m.Get("balance"); got != "90" {
+		t.Fatalf("balance = %q, want 90 (failure 分支不应修改 balance)", got)
+	}
+}
+
+// TestTxnCompareOps 验证支持的比较运算符，以及缺失 key 按空串比较的语义。
+func TestTxnCompareOps(t *testing.T) {
+	cases := []struct {
+		name   string
+		cmp    types.Compare
+		expect bool // 条件是否成立
+	}{
+		{"eq", types.Compare{Key: "k", Op: "==", Value: "5"}, true},
+		{"eq-default-op", types.Compare{Key: "k", Value: "5"}, true},
+		{"ne", types.Compare{Key: "k", Op: "!=", Value: "6"}, true},
+		{"gt", types.Compare{Key: "k", Op: ">", Value: "4"}, true},
+		{"ge", types.Compare{Key: "k", Op: ">=", Value: "5"}, true},
+		{"lt", types.Compare{Key: "k", Op: "<", Value: "6"}, true},
+		{"le", types.Compare{Key: "k", Op: "<=", Value: "5"}, true},
+		{"gt-false", types.Compare{Key: "k", Op: ">", Value: "5"}, false},
+		{"missing-eq-empty", types.Compare{Key: "missing", Op: "==", Value: ""}, true},
+		{"missing-ne", types.Compare{Key: "missing", Op: "!=", Value: "x"}, true},
+		{"missing-eq-nonempty", types.Compare{Key: "missing", Op: "==", Value: "x"}, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newTestMVCC(t)
+			if err := m.Put("k", "5", 1); err != nil {
+				t.Fatalf("Put(k): %v", err)
+			}
+			if err := m.Txn(types.TxnCommand{
+				Op:       "TXN",
+				Compares: []types.Compare{tc.cmp},
+				Success:  []types.Operation{{Op: "PUT", Key: "hit", Value: "1"}},
+				Failure:  []types.Operation{{Op: "PUT", Key: "miss", Value: "1"}},
+			}, 2); err != nil {
+				t.Fatalf("Txn: %v", err)
+			}
+
+			_, hitErr := m.Get("hit")
+			_, missErr := m.Get("miss")
+			if tc.expect {
+				if hitErr != nil || !errors.Is(missErr, ErrKeyNotFound) {
+					t.Fatalf("条件成立：hit err=%v, miss err=%v, want hit 存在且 miss 不存在", hitErr, missErr)
+				}
+			} else {
+				if !errors.Is(hitErr, ErrKeyNotFound) || missErr != nil {
+					t.Fatalf("条件不成立：hit err=%v, miss err=%v, want hit 不存在且 miss 存在", hitErr, missErr)
+				}
+			}
+		})
+	}
+}
+
+// TestTxnIdempotentReplay 验证重放旧事务日志时整条事务被跳过。
+func TestTxnIdempotentReplay(t *testing.T) {
+	m := newTestMVCC(t)
+	if err := m.Put("k", "0", 1); err != nil {
+		t.Fatalf("Put(k): %v", err)
+	}
+
+	txn := types.TxnCommand{
+		Op:       "TXN",
+		Compares: []types.Compare{{Key: "k", Op: "==", Value: "0"}},
+		Success:  []types.Operation{{Op: "PUT", Key: "k", Value: "1"}},
+	}
+	if err := m.Txn(txn, 2); err != nil {
+		t.Fatalf("Txn(index=2): %v", err)
+	}
+	// 模拟重启重放：同一条事务再次应用，条件此时已不成立，
+	// 如果没有幂等检查就会误走 failure 分支。这里让它带一个 failure 写入来验证。
+	txn.Failure = []types.Operation{{Op: "PUT", Key: "replayed", Value: "1"}}
+	if err := m.Txn(txn, 2); err != nil {
+		t.Fatalf("replay Txn(index=2): %v", err)
+	}
+
+	if got, _ := m.Get("k"); got != "1" {
+		t.Fatalf("k = %q, want 1", got)
+	}
+	if _, err := m.Get("replayed"); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("重放的旧事务不应执行 failure 分支, Get(replayed) err = %v", err)
+	}
+	idx, err := m.GetConsistentIndex()
+	if err != nil {
+		t.Fatalf("GetConsistentIndex: %v", err)
+	}
+	if idx != 2 {
+		t.Fatalf("GetConsistentIndex() = %d, want 2", idx)
+	}
+}
+
+// TestTxnRejectsInvalidOperation 验证分支内的非法操作会让整个事务回滚，
+// 不会留下写了一半的数据，也不会推进 consistentIndex 掩盖这条日志。
+func TestTxnRejectsInvalidOperation(t *testing.T) {
+	m := newTestMVCC(t)
+	if err := m.Put("k", "0", 1); err != nil {
+		t.Fatalf("Put(k): %v", err)
+	}
+
+	err := m.Txn(types.TxnCommand{
+		Op: "TXN",
+		Success: []types.Operation{
+			{Op: "PUT", Key: "a", Value: "1"},
+			{Op: "BOGUS", Key: "b"},
+		},
+	}, 2)
+	if err == nil {
+		t.Fatal("Txn with unsupported operation returned nil, want error")
+	}
+
+	if _, err := m.Get("a"); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("事务失败后 a 不应存在, Get(a) err = %v", err)
+	}
+	idx, err := m.GetConsistentIndex()
+	if err != nil {
+		t.Fatalf("GetConsistentIndex: %v", err)
+	}
+	if idx != 1 {
+		t.Fatalf("GetConsistentIndex() = %d, want 1 (失败的事务不应推进索引)", idx)
+	}
+}
+
+// TestTxnDelete 验证事务中的 DELETE 写入墓碑，Get 返回 ErrKeyNotFound。
+func TestTxnDelete(t *testing.T) {
+	m := newTestMVCC(t)
+	if err := m.Put("k", "v", 1); err != nil {
+		t.Fatalf("Put(k): %v", err)
+	}
+
+	if err := m.Txn(types.TxnCommand{
+		Op:      "TXN",
+		Success: []types.Operation{{Op: "DELETE", Key: "k"}},
+	}, 2); err != nil {
+		t.Fatalf("Txn(DELETE): %v", err)
+	}
+	if _, err := m.Get("k"); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("Get(k) after txn delete err = %v, want ErrKeyNotFound", err)
+	}
+}
+
 func TestGetAtRevisionIgnoresOtherKeysWithNUL(t *testing.T) {
 	m := newTestMVCC(t)
 
