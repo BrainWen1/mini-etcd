@@ -107,8 +107,33 @@ func (s *Server) HandlePut(key, value string) error {
 
 // HandleGet 处理客户端的 GET 请求，读取最新数据
 func (s *Server) HandleGet(key string) (string, error) {
-	// 直接去 MVCC 层读最新数据
-	return s.mvcc.Get(key)
+	// 线性一致读：不能直接读本地 MVCC，要先走一次 ReadIndex，
+	// 拿到发起读取时 Leader 已提交的索引，等本地状态机追平后再读。
+	// RequestCtx 必须带节点 ID（见 ReadIndexKey）：只靠节点内序号会在多 follower
+	// 同时读同一 Leader 时被 Raft 的 readOnly 去重逻辑静默丢弃。
+	rctxKey := raftnode.ReadIndexKey(s.Cfg.ID, s.reqSeq.Add(1))
+
+	// 先注册 waiter，再发起 ReadIndex：顺序反过来的话 ReadState 可能先于注册到达，
+	// 客户端只能一直等到超时。
+	ch := s.Rn.RegisterReadIndexWaiter(rctxKey)
+	defer s.Rn.RemoveReadIndexWaiter(rctxKey) // 超时、出错、读取完成都要清理，避免 map 泄漏
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second) // 设置超时时间，防止阻塞
+	defer cancel()
+
+	// ReadIndex 的读取状态会在之后的 Ready 里下发，RequestCtx 会原样带回。
+	// 注意：请求可能被 Raft 静默丢弃（例如 Leader 切换），由下面的超时兜底。
+	if err := s.Rn.Node.ReadIndex(ctx, []byte(rctxKey)); err != nil {
+		return "", fmt.Errorf("read index failed: %w", err)
+	}
+
+	// 阻塞等待本地状态机追平 ReadIndex
+	select {
+	case <-ch: // 状态机已经应用了 ReadIndex 之前的所有日志，此时本地读满足线性一致性
+		return s.mvcc.Get(key)
+	case <-ctx.Done(): // 超时兜底，防止 Raft 迟迟不追平 ReadIndex
+		return "", errors.New("read index timeout")
+	}
 }
 
 // HandleGetAtRevision 处理客户端的 GET 请求，读取指定 revision 的数据
