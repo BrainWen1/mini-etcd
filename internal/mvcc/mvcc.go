@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"mini-etcd/internal/backend"
 	"mini-etcd/internal/types"
+	"time"
 
 	"log"
 )
@@ -19,12 +20,130 @@ var ErrKeyNotFound = errors.New("mvcc: key not found")
 // TombstoneValue 是一个特殊的值，用于标记某个 key 已被删除。
 var TombstoneValue = []byte{0xFF}
 
+const (
+	// 垃圾回收时间间隔
+	gcInterval = 5 * time.Minute
+	// 保留的历史版本数量
+	retainCount = 1000
+)
+
 type MVCC struct {
-	be *backend.Backend
+	be    *backend.Backend
+	stopC chan struct{} // 用于通知 MVCC 停止后台 goroutine 的 channel
+	doneC chan struct{} // 用于通知 MVCC 后台 goroutine 已经退出的 channel
 }
 
 func NewMVCC(be *backend.Backend) *MVCC {
-	return &MVCC{be: be}
+	m := &MVCC{
+		be:    be,
+		stopC: make(chan struct{}),
+		doneC: make(chan struct{}),
+	}
+
+	go m.gcLoop() // 启动后台垃圾回收循环
+
+	return m
+}
+
+// Close 优雅关闭 MVCC，停止后台 goroutine
+func (m *MVCC) Close() error {
+	close(m.stopC) // 通知后台 goroutine 停止
+	<-m.doneC      // 阻塞等待后台 goroutine 完全退出
+	// Server 调用 mvcc.Close() 的时候，可能 gcLoop 协程正在执行 Compact()
+	// 所以 Close() 还要等待 doneC 完全关闭才能退出
+	return nil
+}
+
+// gcLoop 定时触发垃圾回收
+func (m *MVCC) gcLoop() {
+	defer close(m.doneC)                 // 退出时关闭 doneC，通知外部 goroutine 已经退出
+	ticker := time.NewTicker(gcInterval) // 定时器，每隔 gcInterval 触发一次
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.stopC: // 收到停止信号，退出循环
+			return
+		case <-ticker.C: // 定时器触发，执行垃圾回收
+			if err := m.Compact(); err != nil {
+				log.Printf("[GC] compaction failed: %v", err)
+			}
+		}
+	}
+}
+
+// Compact 执行压缩，保留最近的 retainCount 个 revision
+// 核心原则：不仅要看全局 revision，还必须绝对保护每个 Key 的 latestRevision。
+// 因为很多 Key 可能很久没更新了，但是又不能全部删掉，所以需要保留每个 Key 的最新版本。
+// 而在 remainCount 个 revision 之内的历史版本，则根据时间局部性原理，全量保留即可。
+func (m *MVCC) Compact() error {
+	return m.be.Update(func(tx backend.WriteTx) error {
+		// 1. 获取当前全局最新 revision
+		revBytes := tx.Get(backend.MetaBucket, []byte(backend.RevisionKey))
+		if len(revBytes) != 8 {
+			return nil // 还没有数据，无需 GC
+		}
+		currentRev := binary.BigEndian.Uint64(revBytes)
+
+		// 如果当前版本还没达到保留阈值，直接跳过
+		if currentRev <= retainCount {
+			return nil
+		}
+
+		// 计算安全水位线，小于等于这个版本的旧数据是潜在的删除对象
+		targetRev := currentRev - retainCount
+		log.Printf("[GC] 开始垃圾回收, 当前 revision: %d, 压缩水位线: %d", currentRev, targetRev)
+
+		c := tx.GetCursor(backend.DataBucket) // 获取 DataBucket 的游标
+		if c == nil {
+			return nil
+		}
+
+		var keysToDelete [][]byte // 收集要删除的 key\x00rev
+		deletedCount := 0         // 统计删除的历史版本数量
+
+		// 2. 遍历整个 DataBucket（key\x00rev）
+		for k, _ := c.First(); k != nil; k, _ = c.Next() {
+			key, rev := parseKeyAndRevision(k)
+			if rev == 0 {
+				continue // 异常脏数据，跳过
+			}
+
+			// 只有在安全水位线之下的数据才考虑删除
+			if rev <= targetRev {
+				// 必须要保护该 Key 的最新版本
+				// 如果这个 Key 很久没更新了，它的最新版本可能远小于 targetRev。
+				latestRevBytes := tx.Get(backend.DataRevisionBucket, []byte(key))
+				if len(latestRevBytes) == 8 {
+					latestRev := binary.BigEndian.Uint64(latestRevBytes)
+					if rev == latestRev {
+						continue // 这是最新版本，强行保留
+					}
+				}
+
+				// 收集要删除的 key\x00rev
+				// 注意：由于 bbolt 的游标机制，不能在遍历时直接 Delete，所以先收集起来
+				kCopy := make([]byte, len(k))
+				copy(kCopy, k)
+				keysToDelete = append(keysToDelete, kCopy)
+			}
+		}
+
+		// 3. 批量删除旧版本
+		for _, k := range keysToDelete {
+			if err := tx.DeleteKeyInBucket(backend.DataBucket, k); err != nil {
+				return fmt.Errorf("failed to delete old version key %s: %w", k, err)
+			}
+			deletedCount++
+		}
+
+		if deletedCount > 0 {
+			log.Printf("[GC] 垃圾回收完成, 共清理了 %d 个历史版本", deletedCount)
+		} else {
+			log.Printf("[GC] 垃圾回收完成, 没有需要清理的数据")
+		}
+		return nil
+	})
 }
 
 // Put 写入数据和 appliedIndex（同一事务）

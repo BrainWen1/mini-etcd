@@ -60,6 +60,10 @@ func (s *Server) Stop() {
 	// 关闭监听器和所有 TCP 连接，避免进程退出前端口仍被占用、
 	// 以及收发 goroutine 继续在已停止的 Raft 循环上堆积消息
 	s.trans.Close()
+
+	if s.mvcc != nil {
+		s.mvcc.Close() // 优雅关闭 MVCC，停止后台 goroutine
+	}
 }
 
 // nextRequestID 生成进程内唯一的请求 ID：节点 ID + 自增序号。
