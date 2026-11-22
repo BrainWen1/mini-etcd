@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 )
 
 // CommandType 仅用于提取操作类型的信封结构体
@@ -15,9 +14,8 @@ type CommandType struct {
 
 // Command 是写请求在 Raft 日志中的编码格式。
 //
-// 旧实现用空格分隔（"reqID PUT key value"），key 或 value 只要包含空格，
-// strings.Split 就会得到超过 4 段，整条命令被静默丢弃，客户端只能等到超时。
-// 改为 JSON 后 key/value 可以是任意字符串（包括空格、换行等）。
+// 用 JSON 而不是空格分隔：key/value 可以包含空格、换行等任意字符，
+// 不会因为分隔符出现在数据里而把命令解析错。
 type Command struct {
 	RequestID string `json:"request_id"`
 	Op        string `json:"op"`
@@ -27,18 +25,12 @@ type Command struct {
 
 // DecodeCommandType 只解析日志条目的信封（request_id 与操作类型）。
 // PUT/DELETE 和 TXN 的命令结构不同，必须先判断类型，再调用各自的 Decode。
-// 这里同样兼容旧版本的空格分隔格式（"reqID PUT key value"）。
 func DecodeCommandType(data []byte) (CommandType, bool) {
 	var ct CommandType
-	if err := json.Unmarshal(data, &ct); err == nil && ct.Op != "" {
-		return ct, true
+	if err := json.Unmarshal(data, &ct); err != nil || ct.Op == "" {
+		return CommandType{}, false
 	}
-
-	parts := strings.Split(string(data), " ")
-	if len(parts) >= 2 && parts[1] != "" {
-		return CommandType{RequestID: parts[0], Op: parts[1]}, true
-	}
-	return CommandType{}, false
+	return ct, true
 }
 
 // EncodePutCommand 把 PUT 请求编码成可以写进 Raft 日志的字节流
@@ -51,19 +43,13 @@ func EncodeDeleteCommand(requestID, key string) ([]byte, error) {
 	return json.Marshal(Command{RequestID: requestID, Op: "DELETE", Key: key})
 }
 
-// decodeCommand 解析日志数据，并兼容旧版本的空格分隔格式
+// DecodeCommand 解析日志中的 PUT/DELETE 命令。
 func DecodeCommand(data []byte) (Command, bool) {
 	var cmd Command
-	if err := json.Unmarshal(data, &cmd); err == nil && cmd.Op != "" {
-		return cmd, true
+	if err := json.Unmarshal(data, &cmd); err != nil || cmd.Op == "" {
+		return Command{}, false
 	}
-
-	// 兼容旧日志："reqID PUT key value"（只可能是 value 不含空格的历史数据）
-	parts := strings.Split(string(data), " ")
-	if len(parts) == 4 {
-		return Command{RequestID: parts[0], Op: parts[1], Key: parts[2], Value: parts[3]}, true
-	}
-	return Command{}, false
+	return cmd, true
 }
 
 // Compare 定义事务中的一个比较条件。

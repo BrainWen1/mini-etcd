@@ -35,6 +35,16 @@ type peerConn struct {
 	id    uint64              // 目标节点 ID
 	sendC chan raftpb.Message // 异步发送消息的通道
 	stopC chan struct{}       // 停止信号，用于唤醒阻塞中的发送 goroutine
+
+	// stopOnce 保证 stopC 只关闭一次。
+	// Close 和动态移除成员可能并发关闭同一个 peerConn，
+	// 直接 close(stopC) 会 panic: close of closed channel。
+	stopOnce sync.Once
+}
+
+// closeStop 幂等地关闭发送 goroutine 的停止信号。
+func (pc *peerConn) closeStop() {
+	pc.stopOnce.Do(func() { close(pc.stopC) })
 }
 
 // TCPTransport 是一个基于 TCP 的 Raft 消息传输实现
@@ -199,7 +209,7 @@ func (t *TCPTransport) Close() {
 
 		// 关闭所有已建立的连接
 		for _, pc := range conns {
-			close(pc.stopC) // 通知 writeLoop 退出
+			pc.closeStop() // 通知 writeLoop 退出
 			pc.connMu.Lock()
 			if pc.netConn != nil {
 				pc.netConn.Close() // 关闭底层 TCP
@@ -322,9 +332,12 @@ func (t *TCPTransport) dialIfNeeded(pc *peerConn) net.Conn {
 
 	// 检查冷却期；同时确认 transport 没有在拨号期间被关闭，
 	// 否则 Close 之后 writeLoop 仍可能新建一条无人关闭的出站连接。
+	// peers 会在运行时被 AddPeer/RemovePeer 修改，读取必须持锁。
+	// 注意这里只取一次 RLock：之前分开读 closed/failedTime/peers 会与写方产生数据竞争。
 	t.mu.RLock()
 	closed := t.closed
 	lastFailed, failedBefore := t.failedTime[pc.id]
+	addr, ok := t.peers[pc.id]
 	t.mu.RUnlock()
 
 	if closed {
@@ -335,7 +348,6 @@ func (t *TCPTransport) dialIfNeeded(pc *peerConn) net.Conn {
 		return nil // 冷却期内，放弃重试
 	}
 
-	addr, ok := t.peers[pc.id]
 	if !ok || addr == "" {
 		return nil
 	}
@@ -361,4 +373,43 @@ func (t *TCPTransport) recordFailure(to uint64) {
 	t.mu.Lock()
 	t.failedTime[to] = time.Now()
 	t.mu.Unlock()
+}
+
+// AddPeer 添加一个新的集群成员到 peers 映射中（节点动态扩容时由 Raft 循环调用）
+func (t *TCPTransport) AddPeer(id uint64, addr string) {
+	if id == 0 || addr == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.peers[id] = addr
+	// 地址可能变了（同一个 ID 重新加入），清掉旧地址留下的失败冷却，
+	// 让下一条消息立即尝试按新地址建连。
+	delete(t.failedTime, id)
+}
+
+// RemovePeer 从 peers 映射中移除一个集群成员，并关闭对应的连接（节点动态缩容时调用）。
+func (t *TCPTransport) RemovePeer(id uint64) {
+	// 先在锁内完成 map 修改并把 peerConn 摘出来。
+	// 不能持有 t.mu 再去拿 pc.connMu：dialIfNeeded 的加锁顺序是
+	// pc.connMu -> t.mu.RLock，反过来会形成 ABBA 死锁。
+	t.mu.Lock()
+	delete(t.peers, id)
+	delete(t.failedTime, id)
+	pc := t.conns[id]
+	delete(t.conns, id)
+	t.mu.Unlock()
+
+	if pc == nil {
+		return
+	}
+
+	// closeStop 是幂等的，和 Close 并发也安全。
+	pc.closeStop()
+	pc.connMu.Lock()
+	if pc.netConn != nil {
+		pc.netConn.Close()
+		pc.netConn = nil
+	}
+	pc.connMu.Unlock()
 }

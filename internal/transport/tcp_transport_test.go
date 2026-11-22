@@ -70,6 +70,39 @@ func TestTCPTransportSendOrder(t *testing.T) {
 	}
 }
 
+// TestTCPTransportAddRemovePeer 验证动态成员变更能即时反映到传输层：
+// AddPeer 后可以拨号送达；RemovePeer 后消息不再送达，且重复移除不会 panic。
+func TestTCPTransportAddRemovePeer(t *testing.T) {
+	peers := map[uint64]string{}
+	t2 := newTestTransport(t, 2, peers)
+	t1 := newTestTransport(t, 1, peers)
+
+	// 运行时加入节点 2。
+	t1.AddPeer(2, t2.listener.Addr().String())
+	t1.Send([]raftpb.Message{{From: 1, To: 2, Type: raftpb.MsgApp, Term: 1, Index: 1}})
+
+	select {
+	case got := <-t2.Recv():
+		if got.Index != 1 {
+			t.Fatalf("got index %d, want 1", got.Index)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for message after AddPeer")
+	}
+
+	// 运行时移除节点 2。重复调用必须幂等（stopC 只能关闭一次）。
+	t1.RemovePeer(2)
+	t1.RemovePeer(2)
+
+	t1.Send([]raftpb.Message{{From: 1, To: 2, Type: raftpb.MsgApp, Term: 1, Index: 2}})
+	select {
+	case got := <-t2.Recv():
+		t.Fatalf("received message after RemovePeer: %+v", got)
+	case <-time.After(500 * time.Millisecond):
+		// 预期：地址已删除，消息被丢弃
+	}
+}
+
 // TestTCPTransportReconnectAfterWriteError 验证写失败后逻辑连接不会被丢弃：
 // 同一个 writeLoop 应在冷却期结束后重新建连并继续发送，否则每失败一次
 // 就会泄漏一个 goroutine 和一条 fd，且同一节点会出现多条并发连接。

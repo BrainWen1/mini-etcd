@@ -57,6 +57,62 @@ func TestPutSkipsStaleEntry(t *testing.T) {
 	}
 }
 
+// TestMembershipSurvivesSnapshot 验证成员表随 MVCC 快照一起复制。
+//
+// 这是动态扩容的关键不变量：ConfState 只有节点 ID，成员地址只能从状态机里恢复。
+// 如果成员表不进入快照，离线期间错过 ConfChange 日志的节点在通过快照追赶后，
+// 就永远不知道新成员的 Raft/HTTP 地址。
+func TestMembershipSurvivesSnapshot(t *testing.T) {
+	src := newTestMVCC(t)
+	if _, err := src.UpsertMember(4, "127.0.0.1:8004", "127.0.0.1:10004"); err != nil {
+		t.Fatalf("UpsertMember(4): %v", err)
+	}
+	if _, err := src.UpsertMember(5, "127.0.0.1:8005", "127.0.0.1:10005"); err != nil {
+		t.Fatalf("UpsertMember(5): %v", err)
+	}
+
+	snap, err := src.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+
+	dst := newTestMVCC(t)
+	if err := dst.ApplySnapshot(snap); err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+
+	members, err := dst.GetMembers()
+	if err != nil {
+		t.Fatalf("GetMembers: %v", err)
+	}
+	if len(members) != 2 {
+		t.Fatalf("members = %+v, want 2 members", members)
+	}
+	if m := members[4]; m.RaftAddr != "127.0.0.1:8004" || m.HTTPAddr != "127.0.0.1:10004" {
+		t.Fatalf("member 4 = %+v, want both addresses restored", m)
+	}
+
+	// 移除必须同样进入快照：否则恢复后会把已移除的节点重新加回 Transport。
+	if err := dst.RemoveMember(5); err != nil {
+		t.Fatalf("RemoveMember(5): %v", err)
+	}
+	snap2, err := dst.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot after remove: %v", err)
+	}
+	dst2 := newTestMVCC(t)
+	if err := dst2.ApplySnapshot(snap2); err != nil {
+		t.Fatalf("ApplySnapshot after remove: %v", err)
+	}
+	members, err = dst2.GetMembers()
+	if err != nil {
+		t.Fatalf("GetMembers after remove: %v", err)
+	}
+	if _, ok := members[5]; ok {
+		t.Fatalf("member 5 should be gone after removal: %+v", members)
+	}
+}
+
 // TestGetMissingKey 验证 key 不存在时返回 ErrKeyNotFound。
 func TestGetMissingKey(t *testing.T) {
 	m := newTestMVCC(t)

@@ -25,6 +25,16 @@ type WALRecord struct {
 	Entries   []raftpb.Entry
 }
 
+// firstEntryIndex 返回 WAL 中第一条日志的索引；没有日志时返回 0。
+func firstEntryIndex(entriesList [][]raftpb.Entry) uint64 {
+	for _, entries := range entriesList {
+		if len(entries) > 0 {
+			return entries[0].Index
+		}
+	}
+	return 0
+}
+
 type WAL struct {
 	*raft.MemoryStorage            // 因为 Raft 算法需要高频调用 Entries() 和 Term()，每次查磁盘会卡死，所以要用内存存储来缓存
 	mu                  sync.Mutex // 保护并发写入
@@ -66,6 +76,27 @@ func OpenWAL(walPath string, snapPath string) (*WAL, error) {
 		file.Close() // 关闭文件流
 		return nil, err
 	}
+
+	// 日志连续性检查。
+	// MemoryStorage.Append 要求新日志与当前末尾连续；遇到缺口会直接 panic
+	// （missing log entry [last: X, append at: Y]）。接收过 Leader 快照的节点，
+	// WAL 是从快照之后的索引开始写的，一旦快照文件丢失/损坏，重启时就会出现
+	// “WAL 从 101 开始，但没有快照”的缺口。这里提前返回可操作的错误。
+	if firstWAL := firstEntryIndex(entriesList); firstWAL > 0 {
+		if snap == nil && firstWAL > 1 {
+			// 如果 WAL 里有日志，但没有快照文件，说明快照目录丢失或损坏
+			file.Close()
+			return nil, fmt.Errorf("log starts at index %d but no snapshot file was found; "+
+				"the snapshot directory is missing or corrupted", firstWAL)
+		}
+		if snap != nil && firstWAL > snap.Metadata.Index+1 {
+			// 如果 WAL 里第一条日志的索引大于快照索引 + 1，说明快照文件丢失或损坏
+			file.Close()
+			return nil, fmt.Errorf("log gap: latest snapshot is at index %d, but WAL starts at index %d; "+
+				"the snapshot file is missing or corrupted", snap.Metadata.Index, firstWAL)
+		}
+	}
+
 	// 将读取到的数据恢复到内存存储中
 	for _, entries := range entriesList {
 		// 将日志条目追加到内存存储中

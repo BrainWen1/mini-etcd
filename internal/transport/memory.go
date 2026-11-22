@@ -34,3 +34,9 @@ func (t *MemoryTransport) Recv() <-chan raftpb.Message {
 func (t *MemoryTransport) Close() {
 	t.network.Unregister(t.id) // 注销收件箱
 }
+
+// AddPeer/RemovePeer 让 MemoryTransport 也满足 raftnode.Transport 接口。
+// 内存网络按节点 ID 路由，没有地址概念，新节点只要 Register 就会被自动路由到，
+// 因此这两个方法对内存实现是空操作。
+func (t *MemoryTransport) AddPeer(id uint64, addr string) {}
+func (t *MemoryTransport) RemovePeer(id uint64)           {}

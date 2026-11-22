@@ -19,6 +19,8 @@ type Config struct {
 
 	ListenAddr string // Raft 节点监听的地址
 	HTTPPort   string // HTTP API 监听的端口
+
+	Join bool
 }
 
 func Default(id uint64, peers map[uint64]string, httpPeers map[uint64]string) Config {

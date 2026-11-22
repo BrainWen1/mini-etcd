@@ -3,7 +3,9 @@ package raftnode
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"log"
+	"maps"
 	"mini-etcd/internal/config"
 	"slices"
 	"sync"
@@ -16,9 +18,11 @@ import (
 
 // Transport 定义了 Raft 节点之间的消息传输接口
 type Transport interface {
-	Send(msgs []raftpb.Message)  // 发送消息给其他节点
-	Recv() <-chan raftpb.Message // 接收来自其他节点的消息
-	Close()                      // 关闭传输通道
+	Send(msgs []raftpb.Message)     // 发送消息给其他节点
+	Recv() <-chan raftpb.Message    // 接收来自其他节点的消息
+	Close()                         // 关闭传输通道
+	AddPeer(id uint64, addr string) // 添加新的节点到传输通道
+	RemovePeer(id uint64)           // 从传输通道移除节点
 }
 
 // Storage 定义了 Raft 节点的持久化存储接口
@@ -36,9 +40,21 @@ type Storage interface {
 type Applier interface {
 	Apply(entries []raftpb.Entry) error
 	GetConsistentIndex() (uint64, error)
+	AdvanceConsistentIndex(index uint64) error
 	ApplySnapshot(snapshot raftpb.Snapshot) error
 	GetSnapshot() ([]byte, error)
+
+	// 成员表随状态机快照一起复制：ConfState 只有 ID，地址必须由状态机保存，
+	// 否则落后节点通过快照追赶时无法恢复新成员的地址。
+	UpsertMember(id uint64, raftAddr, httpAddr string) (config.Member, error)
+	RemoveMember(id uint64) error
+	GetMembers() (map[uint64]config.Member, error)
 }
+
+// MembershipChangeHandler 在一条配置变更日志被本地应用后回调。
+// added=true 表示新增/更新成员，added=false 表示移除成员。
+// Server 用它同步 Leader 代理所需的 HTTPPeers，并持久化成员表 members（同时包含 Raft 和 HTTP 地址）。
+type MembershipChangeHandler func(id uint64, raftAddr, httpAddr string, added bool)
 
 // RaftNode 封装了 etcd/raft 的 Node，并添加了存储和传输的引用
 type RaftNode struct {
@@ -64,6 +80,18 @@ type RaftNode struct {
 
 	nodeID uint64        // 本节点 ID，用于构造集群范围内唯一的 RequestCtx
 	stopc  chan struct{} // Run 退出时关闭，唤醒阻塞中的读请求
+
+	// 动态成员变更相关
+	membershipHandler MembershipChangeHandler // 配置变更应用后的回调，由 Server 在 Run 之前注入
+	confChangeMu      sync.Mutex              // 保护 confChangeWaiters
+	confChangeWaiters map[string][]chan error // key 为 "type-nodeID"，等待本地应用配置变更的提议者
+	removed           chan struct{}           // 本节点被移出集群时关闭
+	removedOnce       sync.Once               // 保证 removed 只关闭一次
+
+	// members 是本地已知的成员表（含两种地址），与状态机里的成员表保持一致。
+	// 应用快照后用它做 diff，把 Transport 和 Leader 代理表更新到快照对应的成员配置。
+	membersMu sync.RWMutex
+	members   map[uint64]config.Member
 }
 
 // readIndexKeyLen 是 ReadIndexKey 生成的 RequestCtx 长度：8 字节节点 ID + 8 字节进程内序号。
@@ -130,25 +158,66 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 
 	rpeers := make([]raft.Peer, 0, len(peersIDs))
 	for _, id := range peersIDs {
-		rpeers = append(rpeers, raft.Peer{ID: id, Context: []byte(cfg.Peers[id])})
+		// Context 里同时带上 Raft 与 HTTP 地址：Bootstrap 产生的初始 ConfChange
+		// 条目会被 Run 循环当作普通配置变更应用，所有节点都能据此填好成员表。
+		rpeers = append(rpeers, raft.Peer{
+			ID:      id,
+			Context: config.EncodeMemberContext(cfg.Peers[id], cfg.HTTPPeers[id]),
+		})
 	}
 
-	// 从已经持久化的 Storage 中获取 lastIndex 和 HardState，以便正确初始化 Raft 节点
+	// 从已经持久化的 Storage 中获取 lastIndex、HardState 和快照 ConfState
 	// 获取当前 Storage 中最后一条日志的索引
 	lastIndex, err := storage.LastIndex() // 由 raft.Storage 接口提供
 	if err != nil {
 		log.Fatalf("Failed to get last index: %v", err)
 	}
-	// InitialState 获取当前 Storage 中的 HardState
-	hardState, _, err := storage.InitialState() // 由 raft.Storage 接口提供
+	// InitialState 获取当前 Storage 中的 HardState 和快照携带的 ConfState。
+	// 注意 ConfState 只来自快照元数据，不来自 WAL 里的配置变更日志。
+	hardState, snapshotConfState, err := storage.InitialState()
 	if err != nil {
 		log.Fatalf("Failed to get initial state: %v", err)
 	}
+	// 当前磁盘快照。必须在构造 raft 节点之前读取：
+	// 它同时决定 raft 重启时的重放起点和 rn.lastSnapshotIndex 的初值。
+	snap, err := storage.Snapshot()
+	if err != nil {
+		log.Fatalf("Failed to get snapshot: %v", err)
+	}
 
-	// 从 bbolt 存储中获取当前已应用的最高日志索引（appliedIndex），用于初始化 Raft 节点的 Applied 字段
+	// 从 bbolt 存储中获取状态机已经应用到的日志索引（consistentIndex）
 	appliedIndex, err := applier.GetConsistentIndex()
 	if err != nil {
 		log.Fatalf("Failed to get applied index: %v", err)
+	}
+
+	// 状态机里有数据、但 Raft 日志为空：raft.newRaft 会在 appliedTo() 直接 panic
+	// （applied(N) is out of range [prevApplied(0), committed(0)]）。
+	// 常见原因是复用了其他节点的 backend 目录、误删了 WAL 目录，或者以 -join 启动时
+	// 没有清空旧数据。这里提前给出可操作的错误，而不是让进程在 raft 内部崩溃。
+	if lastIndex == 0 && raft.IsEmptyHardState(hardState) && appliedIndex > 0 {
+		log.Fatalf("[Node %d] 本地状态机已有数据 (consistentIndex=%d)，但 Raft 日志为空；请清空该节点数据目录（或确认没有复用其他节点的 backend）后重试",
+			cfg.ID, appliedIndex)
+	}
+
+	// 全新集群（Bootstrap）：空 Storage、空 HardState，且没有 -join。
+	isBootstrap := lastIndex == 0 && raft.IsEmptyHardState(hardState) && !cfg.Join
+
+	// 交给 raft 的 Applied 不能直接用 consistentIndex。
+	//
+	// 快照里的 ConfState 只记录到 snapshot.Metadata.Index 为止的成员配置；
+	// 而 (snapshotIndex, consistentIndex] 之间完全可能存在配置变更日志
+	// （AddNode/RemoveNode，以及 Leader 当选时的空日志）。如果告诉 raft
+	// “这些日志都已应用”，它既不会重放它们，ConfState 里也不会包含这些成员，
+	// 重启后集群成员配置会永久回退：例如刚扩到 4 节点，重启后退回 3 节点的
+	// 多数派判断，甚至完全不知道新节点的存在。
+	//
+	// 所以这里传快照索引，让 raft 从快照之后开始重放日志。状态机的幂等检查
+	// （appliedIndex <= consistentIndex 时跳过）保证业务数据不会被重复写入，
+	// 配置变更则会被重新应用，raft 内存中的成员配置随之恢复。
+	raftApplied := uint64(0)
+	if !isBootstrap && snap.Metadata.Index > 0 {
+		raftApplied = snap.Metadata.Index
 	}
 
 	c := &raft.Config{
@@ -158,22 +227,28 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 		Storage:         storage,
 		MaxSizePerMsg:   1024 * 1024,
 		MaxInflightMsgs: 256,
-		Applied:         appliedIndex,
+		Applied:         raftApplied,
+		// PreVote 对动态缩容很关键：被移除的节点可能还没收到“自己被移除”的日志
+		// （Leader 在应用配置变更后就不再给它发消息了），它会继续发起选举。
+		// 没有 PreVote 时，每次选举都会把集群的 term 抬高一任，逼现有 Leader 下台，
+		// 期间写请求会返回 503；
+		// 开启后，其他节点会拒绝它的预投票，集群 term 不会被打断，已移除节点也无法靠更大的 term 干扰集群。
+		PreVote: true,
 	}
 
 	var node raft.Node
 	var confState raftpb.ConfState
 
-	if lastIndex == 0 && raft.IsEmptyHardState(hardState) {
+	if isBootstrap {
 		// 如果没有日志和 HardState，说明是全新节点，需要启动一个新的 Raft 节点
 		log.Printf("[Node %d] 启动全新 Raft 节点 (Bootstrap)", cfg.ID)
 		node = raft.StartNode(c, rpeers)
 
-		// Bootstrap 后立刻打一个初始快照，把 ConfState 持久化
-		// 快照的 index 传 1（MemoryStorage初始化时自带一个空快照），data 传 nil（状态机是空的）
-		// 手动构造一个包含 ConfState 的快照对象，绕过 CreateSnapshot 的内存检查
+		// Bootstrap 后立刻打一个初始快照，把 ConfState 持久化。
+		// 快照的 index 传 1（MemoryStorage 初始化时自带一个空快照），data 传 nil（状态机是空的）。
+		// 手动构造一个包含 ConfState 的快照对象，绕过 CreateSnapshot 的内存检查。
 		confState = raftpb.ConfState{Voters: peersIDs}
-		snap := raftpb.Snapshot{
+		initialSnap := raftpb.Snapshot{
 			Metadata: raftpb.SnapshotMetadata{
 				Index:     1, // 设为 1 即可，只要大于初始的 0
 				Term:      1,
@@ -181,39 +256,44 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 			},
 		}
 		// 直接调用 SaveSnapshot 落盘，当前进程不 Apply 这个快照，所以不会和 StartNode 冲突
-		if err := storage.SaveSnapshot(snap); err != nil {
+		if err := storage.SaveSnapshot(initialSnap); err != nil {
 			log.Fatalf("Failed to save initial snapshot: %v", err)
 		}
 		log.Printf("[Node %d] 已生成初始快照文件 (index=1)，ConfState.Voters=%v", cfg.ID, peersIDs)
 	} else {
-		// 如果有日志或 HardState，说明是重启节点，需要从持久化存储中恢复
-		log.Printf("[Node %d] 检测到 WAL，重新启动 Raft 节点 (Restart)", cfg.ID)
-		node = raft.RestartNode(c)
-
-		// Restart 时，从 Storage 中读取 ConfState
-		_, cs, err := storage.InitialState()
-		if err != nil {
-			log.Fatalf("Failed to get initial state: %v", err)
-		}
-		if len(cs.Voters) != 0 {
-			// 如果有 Voters，说明是正常的集群配置，记录下来
-			confState = cs
+		if cfg.Join && lastIndex == 0 && raft.IsEmptyHardState(hardState) {
+			// 加入已有集群的新节点：本地没有任何 Raft 状态，也不应该 Bootstrap
+			// （Bootstrap 会让它自成一个集群）。用 RestartNode 以空状态启动，
+			// 等待 Leader 把成员变更日志或快照复制过来。
+			log.Printf("[Node %d] 以空状态启动，等待加入已有集群 (Join)", cfg.ID)
+			node = raft.RestartNode(c)
+			confState = raftpb.ConfState{}
 		} else {
-			// 快照里没带 ConfState（例如旧版本写出的快照，或者快照目录被清空只剩 WAL），
-			// 若让 confState 保持零值，后续本地快照会把空的 ConfState 写进磁盘，
-			// 重启后 voters=() 会让集群配置永久丢失。这里回退到配置里的 peers 兜底。
-			log.Printf("[Node %d] Warning: empty ConfState in storage, falling back to configured peers %v", cfg.ID, peersIDs)
-			confState = raftpb.ConfState{Voters: peersIDs}
+			// 如果有日志或 HardState，说明是重启节点，需要从持久化存储中恢复
+			log.Printf("[Node %d] 检测到 WAL，重新启动 Raft 节点 (Restart)", cfg.ID)
+			node = raft.RestartNode(c)
+
+			// ConfState 只能从快照元数据恢复；快照之后发生的配置变更，
+			// 由 raft 从快照索引开始重放 WAL 时通过 ApplyConfChange 重建。
+			// 为空说明本地没有快照：新加入的节点在收到第一份快照之前重启，
+			// 会退化为“WAL 里有从 1 开始的完整日志”，重放后同样能恢复配置；
+			// 如果 WAL 本身也是空的，下面的空成员配置会让它无法参与选举。
+			confState = snapshotConfState
+			if len(confState.Voters) == 0 {
+				log.Printf("[Node %d] 快照中没有 ConfState，将依赖 WAL 重放配置变更来重建成员配置", cfg.ID)
+			}
 		}
 	}
 
-	// 返回 RaftNode 前获取一下当前快照索引
-	snap, err := storage.Snapshot()
-	if err != nil {
-		log.Fatalf("Failed to get snapshot: %v", err)
-	}
 	if snap.Metadata.Index == 0 {
 		log.Printf("[Node %d] 没有找到快照", cfg.ID)
+	}
+
+	// 启动时的成员表。Transport 运行时会直接修改 cfg.Peers，所以这里构造一份
+	// 独立的 Member 记录；之后每次应用 ConfChange / 快照都会覆盖它。
+	members := make(map[uint64]config.Member, len(cfg.Peers))
+	for id, raftAddr := range cfg.Peers {
+		members[id] = config.Member{ID: id, RaftAddr: raftAddr, HTTPAddr: cfg.HTTPPeers[id]}
 	}
 
 	return &RaftNode{
@@ -232,6 +312,260 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 		// 否则 appliedIndex 从 0 开始，ReadIndex 会一直判定“未追平”，
 		// 而重启后不会再有 CommittedEntries 来推进它，follower 上的读只能等到超时。
 		appliedIndex: appliedIndex,
+
+		confChangeWaiters: make(map[string][]chan error),
+		removed:           make(chan struct{}),
+		members:           members,
+	}
+}
+
+// SetMembershipChangeHandler 注入配置变更回调。必须在 Run 之前调用。
+func (rn *RaftNode) SetMembershipChangeHandler(h MembershipChangeHandler) {
+	rn.mu.Lock()
+	rn.membershipHandler = h
+	rn.mu.Unlock()
+}
+
+func (rn *RaftNode) getMembershipChangeHandler() MembershipChangeHandler {
+	rn.mu.RLock()
+	defer rn.mu.RUnlock()
+	return rn.membershipHandler
+}
+
+// Removed 返回一个在本节点被移出集群时关闭的 channel。
+// main 用它触发优雅退出，而不是在 Raft 循环里直接 os.Exit。
+func (rn *RaftNode) Removed() <-chan struct{} {
+	return rn.removed
+}
+
+func (rn *RaftNode) markRemoved() {
+	rn.removedOnce.Do(func() { close(rn.removed) })
+}
+
+// applyMembershipChange 处理一条已经提交、并且已经调用过 ApplyConfChange 的配置变更。
+//
+// 处理顺序很重要：
+//  1. 先写状态机 —— 成员表必须随快照一起复制，否则落后节点通过快照追赶时
+//     只能拿到 ConfState 里的节点 ID，拿不到 Raft/HTTP 地址；
+//  2. 再改内存里的 members 表；
+//  3. 最后同步 Transport 与 Server 的 Leader 代理表和持久化成员表。
+func (rn *RaftNode) applyMembershipChange(cc *raftpb.ConfChange, member config.Member) {
+	switch cc.Type {
+	case raftpb.ConfChangeAddNode, raftpb.ConfChangeUpdateNode:
+		// 写状态机：UpsertMember 会返回实际写入的成员（可能是更新了地址），
+		// 以便更新内存里的 members 表和 Transport。
+		effective, err := rn.applier.UpsertMember(cc.NodeID, member.RaftAddr, member.HTTPAddr)
+		if err != nil {
+			// 状态机写失败意味着成员表无法进入后续快照，重启/新节点追赶时
+			// 一定会再次出现“找不到新成员地址”的问题，继续运行只会扩大不一致。
+			rn.storage.Close()
+			log.Fatalf("[Node %d] 持久化成员 %d 失败: %v", rn.nodeID, cc.NodeID, err)
+		}
+
+		rn.membersMu.Lock()
+		// 更新内存里的成员表
+		rn.members[cc.NodeID] = effective
+		rn.membersMu.Unlock()
+
+		if effective.RaftAddr == "" {
+			log.Printf("[Node %d] Warning: 成员 %d 没有 Raft 地址，Transport 无法向它发送消息", rn.nodeID, cc.NodeID)
+		} else {
+			// 更新 Transport 的代理表：如果是更新地址，AddPeer 会覆盖旧地址
+			rn.trans.AddPeer(cc.NodeID, effective.RaftAddr)
+		}
+		log.Printf(">>> 集群成员新增/更新: Node %d, RaftAddr: %s, HTTPAddr: %s",
+			cc.NodeID, effective.RaftAddr, effective.HTTPAddr)
+		if h := rn.getMembershipChangeHandler(); h != nil {
+			// 通知 Server 更新 Leader 代理表和持久化成员表 members（同时包含 Raft 和 HTTP 地址）
+			h(cc.NodeID, effective.RaftAddr, effective.HTTPAddr, true)
+		}
+
+	case raftpb.ConfChangeRemoveNode:
+		if err := rn.applier.RemoveMember(cc.NodeID); err != nil {
+			rn.storage.Close()
+			log.Fatalf("[Node %d] 删除成员 %d 失败: %v", rn.nodeID, cc.NodeID, err)
+		}
+
+		rn.membersMu.Lock()
+		delete(rn.members, cc.NodeID)
+		rn.membersMu.Unlock()
+
+		log.Printf(">>> 集群成员移除: Node %d", cc.NodeID)
+		rn.trans.RemovePeer(cc.NodeID)
+		if h := rn.getMembershipChangeHandler(); h != nil {
+			h(cc.NodeID, "", "", false)
+		}
+		// 如果移除的是自己，通知 main 优雅退出。
+		// 不要在 Raft 循环里直接 os.Exit：那会跳过 WAL/传输层的正常关闭流程。
+		if cc.NodeID == rn.nodeID {
+			log.Printf(">>> 当前节点已被移除出集群，准备退出...")
+			rn.markRemoved()
+		}
+
+	default:
+		log.Printf("[Node %d] 未知的配置变更类型: %s", rn.nodeID, cc.Type)
+	}
+}
+
+// syncMembershipFromSnapshot 在本地应用一份 Raft 快照后，把快照里的 ConfState 同步到内存里的成员表，并更新 Transport 与 Server 的代理表
+//
+// 这是“节点离线期间集群又发生变化”场景的关键修复。
+// 例如节点 4 掉线期间节点 5 加入集群，之后节点 4 恢复：
+//   - Leader 里关于节点 5 的 ConfChange 日志可能已经被压缩；
+//   - 节点 4 只能收到快照，而快照的 ConfState 只有节点 ID，没有地址；
+//   - 没有本方法时，节点 4 既不会给节点 5 发 Raft 消息（GET 的 ReadIndex 需要
+//     发给 Leader），Leader 代理表里也没有节点 5 的 HTTP 地址（写请求 503）。
+//
+// 成员地址随状态机快照一起复制，所以 ApplySnapshot 之后从状态机读出来的
+// 成员表就是快照那一刻的完整成员配置。
+func (rn *RaftNode) syncMembershipFromSnapshot(confState raftpb.ConfState) {
+	// 从状态机里读取成员表，和快照里的 ConfState 对比，更新内存里的 members 表。
+	// 同时包含 Raft 和 HTTP 地址
+	stored, err := rn.applier.GetMembers()
+	if err != nil {
+		rn.storage.Close()
+		log.Fatalf("[Node %d] 读取状态机中的成员表失败: %v", rn.nodeID, err)
+	}
+
+	// ConfState 是快照时刻的权威成员集合（可能包含联合配置的 outgoing/learner）。
+	// 状态机里理论上与它一致；以 ConfState 为准可以顺手清掉任何残留。
+	wanted := make(map[uint64]struct{},
+		len(confState.Voters)+len(confState.VotersOutgoing)+len(confState.Learners)+len(confState.LearnersNext))
+	for _, ids := range [][]uint64{
+		confState.Voters,
+		confState.VotersOutgoing,
+		confState.Learners,
+		confState.LearnersNext,
+	} {
+		for _, id := range ids {
+			wanted[id] = struct{}{} // 拿到快照里的所有成员 ID
+		}
+	}
+
+	next := make(map[uint64]config.Member, len(wanted))
+	for id := range wanted {
+		// 根据从 confState 里拿到的 ID 去状态机里查地址，更新内存里的 members 表
+		m, ok := stored[id]
+		if !ok {
+			// 本项目生成快照时，数据与成员表在同一个状态机快照里，二者必须一致。
+			// 走到这里说明状态机数据损坏或被人为改写过，缺失的地址无法凭空恢复。
+			log.Printf("[Node %d] Warning: 快照 ConfState 包含节点 %d，但状态机成员表里没有它的地址",
+				rn.nodeID, id)
+			m = config.Member{ID: id}
+		}
+		next[id] = m
+	}
+
+	rn.membersMu.Lock()
+	// 更新内存里的成员表，供后续的配置变更提议和快照 diff 使用。
+	prev := rn.members
+	rn.members = next
+	rn.membersMu.Unlock()
+
+	// 新增或地址发生变化的成员：更新 Transport 与 Server 的代理表。
+	for id, m := range next {
+		if m.RaftAddr != "" {
+			rn.trans.AddPeer(id, m.RaftAddr)
+		}
+		old, existed := prev[id]
+		if !existed || old.RaftAddr != m.RaftAddr || old.HTTPAddr != m.HTTPAddr {
+			// 成员地址发生变化，需要更新代理表
+			log.Printf("[Node %d] 从快照同步成员: Node %d, RaftAddr: %s, HTTPAddr: %s",
+				rn.nodeID, id, m.RaftAddr, m.HTTPAddr)
+			if h := rn.getMembershipChangeHandler(); h != nil {
+				h(id, m.RaftAddr, m.HTTPAddr, true)
+			}
+		}
+	}
+	// 快照里已经不存在的成员：断开连接并从代理表删除。
+	for id := range prev {
+		if _, ok := next[id]; !ok {
+			rn.trans.RemovePeer(id)
+			if h := rn.getMembershipChangeHandler(); h != nil {
+				h(id, "", "", false)
+			}
+		}
+	}
+}
+
+// Membership 返回当前成员表的副本（供诊断/测试使用）。
+func (rn *RaftNode) Membership() map[uint64]config.Member {
+	rn.membersMu.RLock()
+	defer rn.membersMu.RUnlock()
+	return maps.Clone(rn.members)
+}
+
+// confChangeKey 用于把提议和它最终被应用的那条日志对上。
+// raftpb.ConfChange 没有请求 ID，但 Raft 同一时间只允许一个未完成的配置变更，
+// 因此 type + nodeID 足以唯一标识一次提议。
+func confChangeKey(cc *raftpb.ConfChange) string {
+	return fmt.Sprintf("%d-%d", cc.Type, cc.NodeID)
+}
+
+// ProposeConfChangeAndWait 提交配置变更，并阻塞到该变更在本地被应用。
+//
+// 只调用 Node.ProposeConfChange 只能保证“已入队”，不能保证“已提交”。
+// 如果 HTTP 层此时就返回 200，Leader 可能在变更丢失/超时后仍然告诉客户端成功。
+func (rn *RaftNode) ProposeConfChangeAndWait(ctx context.Context, cc *raftpb.ConfChange) error {
+	key := confChangeKey(cc) // cc.Type + cc.NodeID 唯一标识一次配置变更提议
+	ch := make(chan error, 1)
+
+	rn.confChangeMu.Lock()
+	// 记录提议者的等待 channel，等到本地应用了这条配置变更后再唤醒它。
+	rn.confChangeWaiters[key] = append(rn.confChangeWaiters[key], ch)
+	rn.confChangeMu.Unlock()
+
+	removeWaiter := func() {
+		rn.confChangeMu.Lock()
+		waiters := rn.confChangeWaiters[key]
+		for i, w := range waiters {
+			if w == ch {
+				// [0, i) + [i+1, end) 拼接成新的 slice，去掉 ch
+				// 不能直接用 copy，因为 ch 可能在别的 goroutine 被 close，导致 panic
+				waiters = append(waiters[:i], waiters[i+1:]...)
+				break
+			}
+		}
+		if len(waiters) == 0 {
+			// 如果没有其他提议者在等这条配置变更，直接删除这个 key
+			delete(rn.confChangeWaiters, key)
+		} else {
+			// 还有其他提议者在等这条配置变更，更新 slice
+			rn.confChangeWaiters[key] = waiters
+		}
+		rn.confChangeMu.Unlock()
+	}
+
+	// ProposeConfChange 只保证“已入队”，不能保证“已提交”，所以需要阻塞等待本地应用
+	if err := rn.Node.ProposeConfChange(ctx, cc); err != nil {
+		removeWaiter() // 如果入队失败，直接移除等待者，避免内存泄漏
+		return err
+	}
+
+	select {
+	case err := <-ch: // 等到本地应用了这条配置变更后，提议者会收到通知
+		return err
+	case <-ctx.Done():
+		removeWaiter()
+		return ctx.Err()
+	case <-rn.stopc:
+		removeWaiter()
+		return raft.ErrStopped
+	}
+}
+
+// resolveConfChangeWaiters 在本地应用一条配置变更后唤醒对应的提议者。
+func (rn *RaftNode) resolveConfChangeWaiters(cc *raftpb.ConfChange) {
+	// 拿到 waiters 后立即删除，避免在唤醒过程中又有新的提议者加入，导致重复唤醒。
+	key := confChangeKey(cc)
+	rn.confChangeMu.Lock()
+	waiters := rn.confChangeWaiters[key]
+	delete(rn.confChangeWaiters, key)
+	rn.confChangeMu.Unlock()
+
+	// 遍历所有等待者，发送 nil 表示成功应用配置变更。由于 channel 是带缓冲的，这里不会阻塞。
+	for _, ch := range waiters {
+		ch <- nil // 带缓冲，不会阻塞
 	}
 }
 
