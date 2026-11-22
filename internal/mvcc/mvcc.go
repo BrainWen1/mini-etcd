@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"mini-etcd/internal/backend"
-	"mini-etcd/internal/types"
-	"time"
-
 	"log"
+	"mini-etcd/internal/backend"
+	"mini-etcd/internal/config"
+	"mini-etcd/internal/types"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // ErrKeyNotFound 表示请求的 key 在状态机中不存在
@@ -333,6 +335,33 @@ func parseKeyAndRevision(key []byte) (string, uint64) {
 	return string(parts[0]), rev
 }
 
+// AdvanceConsistentIndex 把状态机的已应用索引推进到 index。
+//
+// 空日志（Leader 当选时写入的 no-op）和配置变更不修改业务数据，但它们同样消耗
+// 一个 Raft 日志下标。快照的 metadata.Index 记的是“最后一条已应用日志”，
+// 如果 consistentIndex 停在这些日志之前，快照索引就会大于状态机索引：
+// 重启时 NewRaftNode 把 Applied 设为 consistentIndex，而 raft 内部认为
+// 快照之前的日志都已应用（raftLog.applied = snapshotIndex），
+// newRaft 的 appliedTo() 会直接 panic：
+//
+//	applied(N) is out of range [prevApplied(M), committed(...)]
+//
+// 所以只要最后一条日志不是“真正写入数据”的普通日志，就必须显式推进索引。
+func (m *MVCC) AdvanceConsistentIndex(index uint64) error {
+	return m.be.Update(func(tx backend.WriteTx) error {
+		var current uint64
+		if b := tx.Get(backend.MetaBucket, []byte(backend.ConsistentIndexKey)); len(b) == 8 {
+			current = binary.BigEndian.Uint64(b)
+		}
+		if index <= current {
+			return nil
+		}
+		idxBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(idxBytes, index)
+		return tx.Put(backend.MetaBucket, []byte(backend.ConsistentIndexKey), idxBytes)
+	})
+}
+
 // GetConsistentIndex 读取当前已应用的最高日志索引（供 main 启动时恢复 Raft 状态用）
 func (m *MVCC) GetConsistentIndex() (uint64, error) {
 	var idx uint64 = 0 // 默认值为 0，表示还没有应用过任何日志
@@ -349,32 +378,112 @@ func (m *MVCC) GetConsistentIndex() (uint64, error) {
 	return idx, err
 }
 
+// ---------------------------------------------------------------------------
+// 集群成员表
+// ---------------------------------------------------------------------------
+//
+// 为什么成员表要放在状态机里，而不是只放在内存/独立 JSON 文件？
+//
+// Raft 的 ConfState 只记录成员 ID，不记录地址。地址原本只存在于
+// ConfChange.Context 里，也就是只存在于“某一条日志”里。一旦这条日志被快照
+// 压缩掉，落后太多的节点通过快照追赶时就只能拿到 ID，拿不到地址：
+//   - Transport 没有新成员的 Raft 地址，发不出 MsgApp/MsgReadIndex；
+//   - Leader 代理表没有新成员的 HTTP 地址，写请求 503。
+//
+// 把成员表写进 bbolt 的 MetaBucket 后，它会随 MVCC 快照一起被复制和恢复，
+// 于是“快照 = 数据 + 成员表”成为一份自洽的状态，新节点恢复快照后能立即
+// 补齐 Transport 和代理地址表。成员表不参与 consistentIndex 的幂等判断，
+// 因此不需要和业务日志共用事务，也不会把索引推快。
+const MembershipMetaPrefix = "member/"
+
+// memberMetaKey 返回成员在 MetaBucket 中的键，例如 "member/4"。
+func memberMetaKey(id uint64) []byte {
+	return []byte(MembershipMetaPrefix + strconv.FormatUint(id, 10))
+}
+
+// UpsertMember 写入/更新一个成员的两种地址，返回写入的记录。
+//
+// ConfChange.Context 永远同时携带 Raft 与 HTTP 地址，所以这里直接以本次
+// 变更的地址为准，不做“空字段保留旧值”的合并。返回最终记录是为了让调用方
+// （Raft 循环）用同一份地址去更新 Transport 与 Leader 代理表。
+func (m *MVCC) UpsertMember(id uint64, raftAddr, httpAddr string) (config.Member, error) {
+	var result config.Member
+	err := m.be.Update(func(tx backend.WriteTx) error {
+		key := memberMetaKey(id)
+		result = config.Member{ID: id, RaftAddr: raftAddr, HTTPAddr: httpAddr}
+		data, err := json.Marshal(result)
+		if err != nil {
+			return fmt.Errorf("encode member %d: %w", id, err)
+		}
+		return tx.Put(backend.MetaBucket, key, data)
+	})
+	return result, err
+}
+
+// RemoveMember 从状态机中删除一个成员。成员被移出集群后，
+// 后续快照里不能再带上它的地址，否则重启后会把已移除节点重新加回 Transport。
+func (m *MVCC) RemoveMember(id uint64) error {
+	return m.be.Update(func(tx backend.WriteTx) error {
+		return tx.DeleteKeyInBucket(backend.MetaBucket, memberMetaKey(id))
+	})
+}
+
+// GetMembers 读取状态机中的全量成员表。
+//
+// 快照恢复后（ApplySnapshot）成员表随 MetaBucket 一起被替换，
+// Raft 循环会用本方法的结果重建 Transport 的 peer 地址表和 Leader 代理表。
+func (m *MVCC) GetMembers() (map[uint64]config.Member, error) {
+	members := make(map[uint64]config.Member)
+	err := m.be.View(func(tx backend.ReadTx) error {
+		all, err := tx.GetAllFromBucket(backend.MetaBucket)
+		if err != nil {
+			return err
+		}
+		for k, v := range all {
+			if !strings.HasPrefix(k, MembershipMetaPrefix) {
+				continue
+			}
+			var member config.Member
+			if err := json.Unmarshal(v, &member); err != nil {
+				// 单条记录损坏说明状态机数据已不可信。这里仍然跳过并告警，
+				// 避免因为一个成员记录让整个节点无法启动；缺失的地址会在
+				// Transport 的告警日志里暴露出来。
+				log.Printf("[mvcc] 忽略损坏的成员记录 %q: %v", k, err)
+				continue
+			}
+			members[member.ID] = member
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return members, nil
+}
+
 // 定义快照的数据结构
 type MVCCSnapshot struct {
 	Data map[string][]byte `json:"data"`
 	Meta map[string][]byte `json:"meta"`
 }
 
-// snapshotMagic 标识当前快照使用 gob 编码。
+// snapshotMagic 标识快照格式为 gob 编码。
 //
-// 早期版本直接用 encoding/json 序列化 MVCCSnapshot，但 Data 桶的 key 是
+// 不能用 encoding/json 序列化 MVCCSnapshot：Data 桶的 key 是
 // "用户 key + \x00 + 8 字节二进制 revision"，其中 revision 的字节很可能不是
 // 合法 UTF-8（例如 revision=128 时最后一位是 0x80）。encoding/json 在序列化
 // 字符串时会把非法 UTF-8 字节替换成 U+FFFD（EF BF BD），于是快照恢复后 key
 // 被改写，数据永久丢失。gob 是二进制安全的，可以原样保留任意字节。
 var snapshotMagic = []byte("MVC2")
 
-// decodeSnapshot 解析快照数据，兼容旧版本的 JSON 格式。
+// decodeSnapshot 解析快照数据。没有 magic 前缀说明数据不是本项目的快照
+// （损坏或被其他数据覆盖），直接报错而不是猜测格式。
 func decodeSnapshot(data []byte) (*MVCCSnapshot, error) {
-	var snap MVCCSnapshot
-	if bytes.HasPrefix(data, snapshotMagic) {
-		if err := gob.NewDecoder(bytes.NewReader(data[len(snapshotMagic):])).Decode(&snap); err != nil {
-			return nil, err
-		}
-		return &snap, nil
+	if !bytes.HasPrefix(data, snapshotMagic) {
+		return nil, errors.New("invalid snapshot: missing MVC2 magic header")
 	}
-	// 旧版快照是裸 JSON（没有 magic 前缀）
-	if err := json.Unmarshal(data, &snap); err != nil {
+	var snap MVCCSnapshot
+	if err := gob.NewDecoder(bytes.NewReader(data[len(snapshotMagic):])).Decode(&snap); err != nil {
 		return nil, err
 	}
 	return &snap, nil

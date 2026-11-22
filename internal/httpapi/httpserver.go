@@ -36,6 +36,10 @@ func (h *HTTPServer) Start(port string) error {
 	mux.HandleFunc("GET /v1/kv/range", h.handleRange)
 	mux.HandleFunc("POST /v1/kv/txn", h.handleTxn)
 
+	// 动态成员管理：写请求同样需要代理到 Leader（配置变更必须由 Leader 提议）
+	mux.HandleFunc("POST /v1/cluster/members/add", h.handleAddMember)
+	mux.HandleFunc("POST /v1/cluster/members/remove", h.handleRemoveMember)
+
 	log.Printf("HTTP API Server 启动，监听 %s", port)
 	return http.ListenAndServe(":"+port, mux)
 }
@@ -327,4 +331,78 @@ func (h *HTTPServer) proxyToLeader(w http.ResponseWriter, r *http.Request) bool 
 	log.Printf("[Proxy] 将请求代理到 Leader %s: %s %s", leaderAddr, r.Method, r.URL.Path)
 	proxy.ServeHTTP(w, r)
 	return true // 处理完毕，不放行原逻辑
+}
+
+// AddMemberRequest 是添加成员请求体。
+type AddMemberRequest struct {
+	ID       uint64 `json:"id"`
+	RaftAddr string `json:"raft_addr"`
+	HTTPAddr string `json:"http_addr"`
+}
+
+// handleAddMember 处理 POST /v1/cluster/members/add，添加新成员到集群
+func (h *HTTPServer) handleAddMember(w http.ResponseWriter, r *http.Request) {
+	if h.proxyToLeader(w, r) {
+		return // 请求被代理到 Leader，当前节点不再处理
+	}
+	// 当前节点是 Leader，继续处理请求
+
+	// 解析请求体
+	var req AddMemberRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	// 校验请求参数
+	if req.ID == 0 {
+		writeError(w, http.StatusBadRequest, "id must be non-zero")
+		return
+	}
+	if req.RaftAddr == "" {
+		writeError(w, http.StatusBadRequest, "raft_addr must not be empty")
+		return
+	}
+	if req.HTTPAddr == "" {
+		writeError(w, http.StatusBadRequest, "http_addr must not be empty")
+		return
+	}
+
+	// 调用 server 的 HandleAddMember 方法处理添加成员请求
+	if err := h.srv.HandleAddMember(req.ID, req.RaftAddr, req.HTTPAddr); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+}
+
+// handleRemoveMember 处理 POST /v1/cluster/members/remove，移除集群成员
+func (h *HTTPServer) handleRemoveMember(w http.ResponseWriter, r *http.Request) {
+	if h.proxyToLeader(w, r) {
+		return // 请求被代理到 Leader，当前节点不再处理
+	}
+	// 当前节点是 Leader，继续处理请求
+
+	var req struct {
+		ID uint64 `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if req.ID == 0 {
+		writeError(w, http.StatusBadRequest, "id must be non-zero")
+		return
+	}
+
+	if err := h.srv.HandleRemoveMember(req.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
 }

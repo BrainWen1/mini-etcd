@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"mini-etcd/internal/config"
 	"mini-etcd/internal/mvcc"
 	"mini-etcd/internal/types"
 	"sync"
@@ -62,11 +63,6 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 	)
 
 	for _, entry := range entries {
-		// 忽略空日志和配置变更日志，只处理普通业务日志
-		if entry.Type != raftpb.EntryNormal || len(entry.Data) == 0 {
-			continue
-		}
-
 		// 先解析命令信封（request_id + op），再在 switch 里调用各自具体的 Decode：
 		// PUT/DELETE 与 TXN 的命令结构不同，不能用同一个 Decode 解析。
 		cmdType, ok := types.DecodeCommandType(entry.Data)
@@ -107,7 +103,7 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 			}
 			// 在进入批次之前校验：非法事务只跳过这一条，而不是让整批回滚。
 			// 校验结果是确定性的，所有节点都会跳过同一条日志，不会造成状态机分歧；
-			// 正常路径下 Server 已经校验过，这里是针对旧/损坏日志的兜底。
+			// 正常路径下 Server 已经校验过，这里是对损坏日志的防御。
 			if err := types.ValidateTxnCommand(txnCmd); err != nil {
 				log.Printf("[apply] 非法事务, 索引: %d, request ID: %s, 错误: %v\n", entry.Index, txnCmd.RequestID, err)
 				a.notifyWaiter(txnCmd.RequestID, err)
@@ -145,6 +141,30 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 // GetConsistentIndex 获取当前已应用的最高日志索引
 func (a *Applier) GetConsistentIndex() (uint64, error) {
 	return a.mvccStorage.GetConsistentIndex()
+}
+
+// AdvanceConsistentIndex 把状态机的已应用索引推进到 index。
+// 空日志和配置变更没有业务数据，但必须计入索引，否则快照索引会超过状态机索引，
+// 重启时 raft 的 appliedTo 会 panic（详见 MVCC.AdvanceConsistentIndex）。
+func (a *Applier) AdvanceConsistentIndex(index uint64) error {
+	return a.mvccStorage.AdvanceConsistentIndex(index)
+}
+
+// UpsertMember 把成员地址写入状态机。
+// 成员表放在状态机里是为了随快照一起复制：ConfState 只有节点 ID，
+// 落后节点只靠快照追赶时无法从快照元数据里恢复 Raft/HTTP 地址。
+func (a *Applier) UpsertMember(id uint64, raftAddr, httpAddr string) (config.Member, error) {
+	return a.mvccStorage.UpsertMember(id, raftAddr, httpAddr)
+}
+
+// RemoveMember 从状态机中删除成员。
+func (a *Applier) RemoveMember(id uint64) error {
+	return a.mvccStorage.RemoveMember(id)
+}
+
+// GetMembers 读取状态机中的全量成员表（快照恢复后用它重建地址表）。
+func (a *Applier) GetMembers() (map[uint64]config.Member, error) {
+	return a.mvccStorage.GetMembers()
 }
 
 // ApplySnapshot 应用快照到状态机

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"mini-etcd/internal/apply"
 	"mini-etcd/internal/config"
 	"mini-etcd/internal/mvcc"
@@ -11,8 +12,11 @@ import (
 	"mini-etcd/internal/storage"
 	"mini-etcd/internal/transport"
 	"mini-etcd/internal/types"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
 // Server 代表一个 Raft 节点的服务实例
@@ -30,7 +34,16 @@ type Server struct {
 	// 轻则某个请求一直等到超时，重则客户端收到另一个请求的执行结果。
 	reqSeq atomic.Uint64
 
-	stopc chan struct{}
+	// 动态成员信息。
+	// httpPeers 是 Leader 代理用的地址表：必须和 Raft 成员变更同步更新，
+	// 否则新节点当选 Leader 后，老节点会代理到空地址（HTTP 503）。
+	// members 同时保存 Raft/HTTP 地址，用于重复添加校验和成员查询。
+	membersMu sync.RWMutex
+	httpPeers map[uint64]string
+	members   map[uint64]config.Member
+
+	stopc    chan struct{}
+	stopOnce sync.Once
 }
 
 // NewServer 创建一个新的 Server 实例
@@ -38,15 +51,47 @@ func NewServer(cfg config.Config, storage *storage.WAL, trans *transport.TCPTran
 	// 创建 RaftNode 实例
 	rn := raftnode.NewRaftNode(cfg, storage, trans, applier)
 
-	return &Server{
-		Cfg:     cfg,
-		Rn:      rn,
-		trans:   trans,
-		storage: storage,
-		Applier: applier,
-		mvcc:    mvcc,
-		stopc:   make(chan struct{}),
+	// 复制一份 HTTP 地址表，避免和外部共享的 map 产生并发读写。
+	httpPeers := maps.Clone(cfg.HTTPPeers)
+	if httpPeers == nil {
+		httpPeers = make(map[uint64]string)
 	}
+	members := make(map[uint64]config.Member, len(cfg.Peers))
+	for id, raftAddr := range cfg.Peers {
+		members[id] = config.Member{ID: id, RaftAddr: raftAddr, HTTPAddr: cfg.HTTPPeers[id]}
+	}
+
+	s := &Server{
+		Cfg:       cfg,
+		Rn:        rn,
+		trans:     trans,
+		storage:   storage,
+		Applier:   applier,
+		mvcc:      mvcc,
+		httpPeers: httpPeers,
+		members:   members,
+		stopc:     make(chan struct{}),
+	}
+
+	// 每条配置变更日志被应用后，所有节点都会同步更新成员表并落盘。
+	rn.SetMembershipChangeHandler(s.applyMembershipChange)
+
+	return s
+}
+
+// applyMembershipChange 由一个已提交的 ConfChange 触发（在 Raft 循环 goroutine 中执行）。
+// 所有节点都会执行同一串变更，因此成员表在集群范围内收敛。
+// 更新 server 的成员表和 HTTP 代理表。
+func (s *Server) applyMembershipChange(id uint64, raftAddr, httpAddr string, added bool) {
+	s.membersMu.Lock()
+	if added { // added=true 表示新增或更新成员
+		s.members[id] = config.Member{ID: id, RaftAddr: raftAddr, HTTPAddr: httpAddr}
+		s.httpPeers[id] = httpAddr
+	} else {
+		delete(s.members, id)
+		delete(s.httpPeers, id)
+	}
+	s.membersMu.Unlock()
 }
 
 func (s *Server) Start() {
@@ -55,15 +100,24 @@ func (s *Server) Start() {
 }
 
 func (s *Server) Stop() {
-	// 通知 stopc 关闭，RaftNode 的 Run 循环会退出
-	close(s.stopc)
-	// 关闭监听器和所有 TCP 连接，避免进程退出前端口仍被占用、
-	// 以及收发 goroutine 继续在已停止的 Raft 循环上堆积消息
-	s.trans.Close()
+	// 幂等：被移出集群的节点会从 Removed 通道退出，用户也可能同时按 Ctrl-C，
+	// 两条路径都调用 Stop 时不能重复 close(stopc)（会 panic）。
+	s.stopOnce.Do(func() {
+		// 通知 stopc 关闭，RaftNode 的 Run 循环会退出
+		close(s.stopc)
+		// 关闭监听器和所有 TCP 连接，避免进程退出前端口仍被占用、
+		// 以及收发 goroutine 继续在已停止的 Raft 循环上堆积消息
+		s.trans.Close()
 
-	if s.mvcc != nil {
-		s.mvcc.Close() // 优雅关闭 MVCC，停止后台 goroutine
-	}
+		if s.mvcc != nil {
+			s.mvcc.Close() // 优雅关闭 MVCC，停止后台 goroutine
+		}
+	})
+}
+
+// Removed 返回一个在本节点被移出集群时关闭的 channel。
+func (s *Server) Removed() <-chan struct{} {
+	return s.Rn.Removed()
 }
 
 // nextRequestID 生成进程内唯一的请求 ID：节点 ID + 自增序号。
@@ -195,5 +249,93 @@ func (s *Server) GetLeaderHTTPAddr() string {
 	if leaderID == 0 {
 		return ""
 	}
-	return s.Cfg.HTTPPeers[leaderID] // 返回 Leader 的 HTTP 地址
+	// 成员变更会并发修改这张表，必须加读锁。
+	// 直接读 Cfg.HTTPPeers 会漏掉动态加入的节点，也可能触发 concurrent map read/write。
+	s.membersMu.RLock()
+	defer s.membersMu.RUnlock()
+	return s.httpPeers[leaderID] // 返回 Leader 的 HTTP 地址
+}
+
+// Member 返回指定成员的信息（用于外部查询/测试）。
+func (s *Server) Member(id uint64) (config.Member, bool) {
+	s.membersMu.RLock()
+	defer s.membersMu.RUnlock()
+	m, ok := s.members[id]
+	return m, ok
+}
+
+// HandleAddMember 处理客户端的 AddMember 请求：提交配置变更并等待本地应用完成。
+//
+// raftAddr 是新节点的 Raft 通信地址（Transport 拨号用）；
+// httpAddr 是新节点的 HTTP API 地址（Leader 代理用）。两者都必须提供，
+// 只记 Raft 地址会导致新节点当选 Leader 后整个集群的写请求无法代理。
+func (s *Server) HandleAddMember(id uint64, raftAddr, httpAddr string) error {
+	if id == 0 {
+		return errors.New("member id must be non-zero")
+	}
+	if raftAddr == "" {
+		return errors.New("raft address must not be empty")
+	}
+	if httpAddr == "" {
+		return errors.New("http address must not be empty")
+	}
+
+	s.membersMu.RLock()
+	existing, exists := s.members[id]
+	s.membersMu.RUnlock()
+	if exists {
+		// 幂等：重复提交完全相同的变更直接视为成功。
+		// 地址不同则拒绝：Raft 的 AddNode 对已存在节点是空操作，
+		// 但本地 Transport 会被改成新地址，导致各节点成员表不一致。
+		if existing.RaftAddr == raftAddr && existing.HTTPAddr == httpAddr {
+			return nil
+		}
+		return fmt.Errorf("member %d already exists as raft=%s http=%s; remove it first",
+			id, existing.RaftAddr, existing.HTTPAddr)
+	}
+
+	// members 里没有这个 id，提交配置变更给 Raft 并等待本地应用完成。
+	cc := &raftpb.ConfChange{
+		Type:    raftpb.ConfChangeAddNode,
+		NodeID:  id,
+		Context: config.EncodeMemberContext(raftAddr, httpAddr),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Rn.ProposeConfChangeAndWait(ctx, cc); err != nil {
+		return fmt.Errorf("propose conf change failed: %w", err)
+	}
+	return nil
+}
+
+// HandleRemoveMember 处理客户端的 RemoveMember 请求：提交配置变更并等待本地应用完成。
+func (s *Server) HandleRemoveMember(id uint64) error {
+	if id == 0 {
+		return errors.New("member id must be non-zero")
+	}
+
+	s.membersMu.RLock()
+	_, exists := s.members[id]
+	remaining := len(s.members)
+	s.membersMu.RUnlock()
+	if !exists {
+		return fmt.Errorf("member %d not found", id)
+	}
+	// 移除最后一个成员会让集群永久失去法定人数，直接拒绝。
+	if remaining <= 1 {
+		return errors.New("refusing to remove the last member")
+	}
+
+	cc := &raftpb.ConfChange{
+		Type:   raftpb.ConfChangeRemoveNode,
+		NodeID: id,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.Rn.ProposeConfChangeAndWait(ctx, cc); err != nil {
+		return fmt.Errorf("propose conf change failed: %w", err)
+	}
+	return nil
 }

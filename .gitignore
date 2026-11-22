@@ -1,3 +1,4 @@
 *.log
 *.snap
 *.db
+*.json

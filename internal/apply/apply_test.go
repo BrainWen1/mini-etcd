@@ -98,8 +98,8 @@ func TestApplyTxn(t *testing.T) {
 func TestApplyUnparseableTxnNotifiesWaiter(t *testing.T) {
 	a := newTestApplier(t)
 
-	// 旧格式（空格分隔）解析出的 Op 恰好是 TXN，但内容不是合法的事务 JSON。
-	data := []byte("bad-1 TXN k v")
+	// 信封能解析出 request_id 和 op=TXN，但事务体本身不是合法结构。
+	data := []byte(`{"request_id":"bad-1","op":"TXN","compares":"not-an-array"}`)
 	waitCh := a.RegisterWaiter("bad-1")
 
 	if err := a.Apply([]raftpb.Entry{{Index: 1, Type: raftpb.EntryNormal, Data: data}}); err != nil {
@@ -224,29 +224,5 @@ func TestApplyBatchNotifiesOnlyAfterCommit(t *testing.T) {
 	}
 	if idx != 4 {
 		t.Fatalf("GetConsistentIndex() = %d, want 4", idx)
-	}
-}
-
-// TestApplyLegacyPutCommand 验证先解析信封、再按类型 Decode 之后，
-// 旧的空格分隔 PUT 日志仍能被应用（否则升级后重放旧 WAL 会丢数据）。
-func TestApplyLegacyPutCommand(t *testing.T) {
-	a := newTestApplier(t)
-
-	if err := a.Apply([]raftpb.Entry{{Index: 1, Type: raftpb.EntryNormal, Data: []byte("123 PUT name mini-etcd")}}); err != nil {
-		t.Fatalf("Apply(legacy put): %v", err)
-	}
-	if got, ok := a.Get("name"); !ok || got != "mini-etcd" {
-		t.Fatalf("name = %q, ok = %v; want mini-etcd", got, ok)
-	}
-}
-
-// TestDecodeLegacyCommand 验证旧的空格分隔日志仍能解析，避免升级后无法重放旧 WAL。
-func TestDecodeLegacyCommand(t *testing.T) {
-	cmd, ok := types.DecodeCommand([]byte("123 PUT name mini-etcd"))
-	if !ok {
-		t.Fatal("decodeCommand(legacy) failed")
-	}
-	if cmd.RequestID != "123" || cmd.Op != "PUT" || cmd.Key != "name" || cmd.Value != "mini-etcd" {
-		t.Fatalf("decodeCommand(legacy) = %+v", cmd)
 	}
 }
