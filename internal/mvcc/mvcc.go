@@ -151,7 +151,8 @@ func (m *MVCC) Compact() error {
 // Put 写入数据和 appliedIndex（同一事务）
 func (m *MVCC) Put(key, value string, appliedIndex uint64) error {
 	return m.be.Update(func(tx backend.WriteTx) error {
-		return applyPut(tx, key, value, appliedIndex)
+		_, err := applyPut(tx, key, value, appliedIndex)
+		return err
 	})
 }
 
@@ -170,33 +171,58 @@ type Entry struct {
 // 每条日志单独开启一次写事务意味着一批日志要付出同样多次 fsync，批量应用把整批
 // 日志的落盘成本压缩成一次。整批要么全部生效、要么全部回滚，因此调用方必须等
 // 本方法成功返回之后才能通知客户端写入成功。
-func (m *MVCC) ApplyBatch(entries []Entry) error {
+func (m *MVCC) ApplyBatch(entries []Entry) ([]Event, error) {
 	if len(entries) == 0 {
-		return nil
+		return nil, nil
 	}
-	return m.be.Update(func(tx backend.WriteTx) error { // 在同一个 bbolt 事务里应用整批日志
+	var allEvents []Event                               // 本批应用成功后要通知的事件
+	err := m.be.Update(func(tx backend.WriteTx) error { // 在同一个 bbolt 事务里应用整批日志
 		for _, e := range entries {
 			var err error
+			var events []Event
 			switch e.Op {
 			case "PUT":
-				err = applyPut(tx, e.Key, e.Value, e.Index)
+				events, err = applyPut(tx, e.Key, e.Value, e.Index)
 			case "DELETE":
-				err = applyPut(tx, e.Key, string(TombstoneValue), e.Index)
+				events, err = applyPut(tx, e.Key, string(TombstoneValue), e.Index)
 			case "TXN":
-				err = applyTxn(tx, e.Txn, e.Index)
+				events, err = applyTxn(tx, e.Txn, e.Index)
 			default:
 				err = fmt.Errorf("mvcc: unsupported entry op %q", e.Op)
 			}
 			if err != nil {
 				return err
 			}
+
+			// 收集事件，供 Watch 监听器使用
+			allEvents = append(allEvents, events...)
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return allEvents, nil
+}
+
+// Event 是状态机变更事件，供 Watch 监听器使用。
+type Event struct {
+	Type     string // "PUT" 或 "DELETE"
+	Key      string
+	Value    string
+	Revision uint64 // 变更发生时的全局 revision，用于 Watch 监听器判断事件顺序
+}
+
+func (e Event) JSON() string {
+	b, err := json.Marshal(e)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 // applyPut 在给定事务内写入一条 KV，并推进 consistentIndex
-func applyPut(tx backend.WriteTx, key, value string, appliedIndex uint64) error {
+func applyPut(tx backend.WriteTx, key, value string, appliedIndex uint64) ([]Event, error) {
 	// 1. 先做幂等检查：appliedIndex 小于等于当前 consistentIndex，说明这条日志
 	//    之前已经应用过（重启重放、快照回放等），整条日志都必须跳过。
 	//    注意顺序：一定不能先写业务数据再判断，否则重放旧日志会把新值覆盖成旧值。
@@ -209,7 +235,7 @@ func applyPut(tx backend.WriteTx, key, value string, appliedIndex uint64) error 
 	// 不管 currentIdx 是默认值 0 还是从 metaBucket 中读到的值，都要和 appliedIndex 做比较，保证幂等性
 	if appliedIndex <= currentIdx {
 		log.Printf("[mvcc] Put: appliedIndex %d <= current consistentIndex %d, skipping duplicate entry\n", appliedIndex, currentIdx)
-		return nil
+		return nil, nil
 	}
 
 	// 2. 更新全局 revision
@@ -224,20 +250,20 @@ func applyPut(tx backend.WriteTx, key, value string, appliedIndex uint64) error 
 	binary.BigEndian.PutUint64(revBytes, currentRev)
 	if err := tx.Put(backend.MetaBucket, []byte(backend.RevisionKey), revBytes); err != nil { // 把自增后的 revision 写回 metaBucket
 		log.Printf("Failed to update revision: %v", err)
-		return err
+		return nil, err
 	}
 
 	// 3. 写入 Data 桶，key + revision 作为唯一标识，保证同一个 key 的不同版本可以共存
 	keyBytes := backend.GetKeyWithRevision(key, currentRev)
 	if err := tx.Put(backend.DataBucket, keyBytes, []byte(value)); err != nil {
 		log.Printf("Failed to put key %s: %v", key, err)
-		return err
+		return nil, err
 	}
 
 	// 4. 更新 DataRevision 桶，记录每个 key 的最新 revision，方便 Get 时获取最新值
 	if err := tx.Put(backend.DataRevisionBucket, []byte(key), revBytes); err != nil {
 		log.Printf("Failed to update DataRevision for key %s: %v", key, err)
-		return err
+		return nil, err
 	}
 
 	// 5. 把 uint64 的 appliedIndex 转成 8 字节的 []byte，和数据在同一事务里更新，
@@ -246,10 +272,22 @@ func applyPut(tx backend.WriteTx, key, value string, appliedIndex uint64) error 
 	binary.BigEndian.PutUint64(idxBytes, appliedIndex)
 	if err := tx.Put(backend.MetaBucket, []byte(backend.ConsistentIndexKey), idxBytes); err != nil {
 		log.Printf("Failed to update consistent index: %v", err)
-		return err
+		return nil, err
 	}
 
-	return nil
+	// 6. 构造事件，供 Watch 监听器使用
+	eventType := "PUT"
+	if value == string(TombstoneValue) {
+		eventType = "DELETE"
+	}
+	return []Event{
+		{
+			Type:     eventType,
+			Key:      key,
+			Value:    value,
+			Revision: currentRev,
+		},
+	}, nil
 }
 
 // Get 获取指定 key 的最新值，如果 key 不存在则返回 ErrKeyNotFound
@@ -673,12 +711,13 @@ func (m *MVCC) Range(prefix string, limit int) ([]KVPair, error) {
 // 条件判断和分支内的写入必须原子完成：否则并发读可能看到"条件已满足"却还没写入的中间状态。
 func (m *MVCC) Txn(txnCmd types.TxnCommand, appliedIndex uint64) error {
 	return m.be.Update(func(tx backend.WriteTx) error {
-		return applyTxn(tx, txnCmd, appliedIndex)
+		_, err := applyTxn(tx, txnCmd, appliedIndex)
+		return err
 	})
 }
 
 // applyTxn 在给定事务内执行一条事务日志
-func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) error {
+func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) ([]Event, error) {
 	// 1. 幂等检查（与 Put 相同）：重放旧日志时整条事务都必须跳过
 	var currentIdx uint64 = 0
 	currentIdxBytes := tx.Get(backend.MetaBucket, []byte(backend.ConsistentIndexKey))
@@ -686,7 +725,7 @@ func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) 
 		currentIdx = binary.BigEndian.Uint64(currentIdxBytes)
 	}
 	if appliedIndex <= currentIdx {
-		return nil // 重复应用，直接跳过
+		return nil, nil // 重复应用，直接跳过
 	}
 
 	// 2. 评估所有 If 条件（多个条件之间是 AND）。
@@ -696,7 +735,7 @@ func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) 
 		actualVal, _ := getTxValue(tx, cmp.Key)
 		matched, err := cmp.Match(actualVal)
 		if err != nil {
-			return fmt.Errorf("txn compare %q: %w", cmp.Key, err)
+			return nil, fmt.Errorf("txn compare %q: %w", cmp.Key, err)
 		}
 		if !matched {
 			allMatched = false
@@ -717,6 +756,8 @@ func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) 
 		currentRev = binary.BigEndian.Uint64(revBytes)
 	}
 
+	var events []Event
+
 	for _, op := range ops {
 		var valToWrite []byte
 		switch op.Op {
@@ -726,7 +767,7 @@ func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) 
 			valToWrite = TombstoneValue
 		default:
 			// 正常路径下 Server 已经校验过；这里兜底，避免把非法操作当成空值写入。
-			return fmt.Errorf("txn: unsupported operation %q", op.Op)
+			return nil, fmt.Errorf("txn: unsupported operation %q", op.Op)
 		}
 
 		currentRev++ // 事务内的每个写操作，Revision 都加 1
@@ -734,22 +775,35 @@ func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) 
 		// 写入 DataBucket
 		keyWithRev := backend.GetKeyWithRevision(op.Key, currentRev)
 		if err := tx.Put(backend.DataBucket, keyWithRev, valToWrite); err != nil {
-			return err
+			return nil, err
 		}
 
 		// 更新 DataRevisionBucket
 		opRevBytes := make([]byte, 8)
 		binary.BigEndian.PutUint64(opRevBytes, currentRev)
 		if err := tx.Put(backend.DataRevisionBucket, []byte(op.Key), opRevBytes); err != nil {
-			return err
+			return nil, err
 		}
+
+		// 构造事件，供 Watch 监听器使用
+		eventType := op.Op
+		events = append(events, Event{
+			Type:     eventType,
+			Key:      op.Key,
+			Value:    string(valToWrite),
+			Revision: currentRev,
+		})
 	}
 
 	// 5. 更新全局 Revision 和 AppliedIndex（同一事务，保证原子落盘）
 	if err := putMetaUint64(tx, backend.RevisionKey, currentRev); err != nil {
-		return err
+		return nil, err
 	}
-	return putMetaUint64(tx, backend.ConsistentIndexKey, appliedIndex)
+	if err := putMetaUint64(tx, backend.ConsistentIndexKey, appliedIndex); err != nil {
+		return nil, err
+	}
+
+	return events, nil
 }
 
 // getTxValue 在同一个 bbolt 事务内读取 key 的最新值。

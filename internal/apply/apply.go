@@ -12,16 +12,26 @@ import (
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
+type WatchNotifier interface {
+	Notify(key string, event mvcc.Event)
+}
+
 // Applier 定义了应用已提交日志条目的接口
 type Applier struct {
-	mvccStorage *mvcc.MVCC // 状态机的持久化存储
-	waiters     sync.Map   // 用于等待日志应用完成的同步机制，key 是 requestID，value 是 chan error
+	mvccStorage *mvcc.MVCC    // 状态机的持久化存储
+	waiters     sync.Map      // 用于等待日志应用完成的同步机制，key 是 requestID，value 是 chan error
+	notifier    WatchNotifier // 用于通知 Server 层的 Hub，触发 watch channel 的事件分发
 }
 
 func NewApplier(mvccStorage *mvcc.MVCC) *Applier {
 	return &Applier{
 		mvccStorage: mvccStorage,
 	}
+}
+
+// SetNotifier 设置通知器
+func (a *Applier) SetNotifier(notifier WatchNotifier) {
+	a.notifier = notifier
 }
 
 // notifyWaiter 唤醒等待该请求的客户端（如果客户端还没超时离开）
@@ -120,7 +130,8 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 	}
 
 	if len(batch) > 0 {
-		if err := a.mvccStorage.ApplyBatch(batch); err != nil {
+		events, err := a.mvccStorage.ApplyBatch(batch)
+		if err != nil {
 			// 整批已经回滚，这一批里的客户端一个都不能收到成功
 			for _, id := range waiters {
 				a.notifyWaiter(id, err)
@@ -128,6 +139,13 @@ func (a *Applier) Apply(entries []raftpb.Entry) error {
 			log.Printf("[apply] 应用日志失败, 索引: %d-%d, 错误: %v\n", batch[0].Index, batch[len(batch)-1].Index, err)
 			return err
 		}
+		// 成功应用一批日志后，通知所有 watch channel
+		for _, event := range events {
+			if a.notifier != nil {
+				a.notifier.Notify(event.Key, event)
+			}
+		}
+
 		log.Printf("[apply] 已应用 %d 条日志, 索引: %d-%d\n", len(batch), batch[0].Index, batch[len(batch)-1].Index)
 	}
 
