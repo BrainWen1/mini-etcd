@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"maps"
 	"mini-etcd/internal/apply"
 	"mini-etcd/internal/config"
@@ -44,6 +45,9 @@ type Server struct {
 
 	stopc    chan struct{}
 	stopOnce sync.Once
+
+	// key -> []chan string，按 key 注册的监听器列表。每条变更日志应用后会通知所有监听器。
+	watchChannels sync.Map
 }
 
 // NewServer 创建一个新的 Server 实例
@@ -338,4 +342,54 @@ func (s *Server) HandleRemoveMember(id uint64) error {
 		return fmt.Errorf("propose conf change failed: %w", err)
 	}
 	return nil
+}
+
+// Watch 注册一个监听器，返回一个 channel，客户端可以从中接收指定 key 的变更事件。
+// 监听器是按 key 注册的，客户端可以注册多个 key 的监听器。
+// 返回的 channel 是带缓冲的，防止客户端处理太慢阻塞 Apply。
+func (s *Server) Watch(key string) chan mvcc.Event {
+	// 创建 channel
+	ch := make(chan mvcc.Event, 100)
+
+	// 获取 key 对应的监听器列表，如果不存在则创建一个空列表
+	actual, _ := s.watchChannels.LoadOrStore(key, make([]chan mvcc.Event, 0))
+
+	// 将新 channel 添加到监听器列表并存储回 sync.Map
+	chans := actual.([]chan mvcc.Event)
+	s.watchChannels.Store(key, append(chans, ch))
+	return ch
+}
+
+// Unwatch 注销一个监听器，停止接收指定 key 的变更事件。
+func (s *Server) Unwatch(key string, ch chan mvcc.Event) {
+	if actual, ok := s.watchChannels.Load(key); ok {
+		chans := actual.([]chan mvcc.Event)
+		for i, c := range chans {
+			if c == ch {
+				chans = append(chans[:i], chans[i+1:]...) // 从切片中移除 channel
+				break
+			}
+		}
+		// 如果移除后列表为空，则从 sync.Map 中删除该 key，否则更新列表
+		if len(chans) == 0 {
+			s.watchChannels.Delete(key)
+		} else {
+			s.watchChannels.Store(key, chans)
+		}
+	}
+}
+
+// 通知（由 apply 层调用）
+func (s *Server) Notify(key string, event mvcc.Event) {
+	if actual, ok := s.watchChannels.Load(key); ok {
+		for _, ch := range actual.([]chan mvcc.Event) {
+			select {
+			case ch <- event:
+			default:
+				// 如果 ch 满了，说明客户端处理太慢，直接丢弃事件并踢掉客户端
+				// 这里先简单地打印日志，后续可以加入踢掉客户端的逻辑
+				log.Printf("[Node %d] Watch channel for key %q is full, dropping event and closing channel", s.Cfg.ID, key)
+			}
+		}
+	}
 }

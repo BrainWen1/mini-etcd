@@ -171,6 +171,7 @@ func main() {
 
 	// 组装 Server
 	srv := server.NewServer(cfg, storage, trans, applier, mvccStorage)
+	applier.SetNotifier(srv) // 设置通知器，让 Applier 可以通知 Server 层的 Hub，触发 watch channel 的事件分发
 	go srv.Start()
 
 	time.Sleep(2 * time.Second) // 先等待节点集群选出 Leader

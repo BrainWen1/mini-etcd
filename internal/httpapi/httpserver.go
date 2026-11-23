@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"mini-etcd/internal/mvcc"
 	"mini-etcd/internal/server"
@@ -35,6 +36,7 @@ func (h *HTTPServer) Start(port string) error {
 	mux.HandleFunc("DELETE /v1/kv/{key}", h.handleDelete)
 	mux.HandleFunc("GET /v1/kv/range", h.handleRange)
 	mux.HandleFunc("POST /v1/kv/txn", h.handleTxn)
+	mux.HandleFunc("GET /v1/kv/watch", h.handleWatch)
 
 	// 动态成员管理：写请求同样需要代理到 Leader（配置变更必须由 Leader 提议）
 	mux.HandleFunc("POST /v1/cluster/members/add", h.handleAddMember)
@@ -405,4 +407,47 @@ func (h *HTTPServer) handleRemoveMember(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+}
+
+// httpapi/watch.go
+func (h *HTTPServer) handleWatch(w http.ResponseWriter, r *http.Request) {
+	// 1. 设置 SSE 必须的 Header
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// 获取 Flusher（如果是 HTTP/2，可能不支持 Flusher，这里用的是 HTTP/1.1）
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
+		return
+	}
+
+	key := r.URL.Query().Get("key")
+
+	// 2. 注册 Channel，拿到接收事件的通道
+	ch := h.srv.Watch(key)
+	defer h.srv.Unwatch(key, ch) // 客户端断开时清理
+
+	// 3. 启动心跳 ticker，防止反向代理断开连接
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	// 4. 死循环阻塞读取
+	for {
+		select {
+		case <-r.Context().Done():
+			// 客户端主动断开了连接
+			return
+		case <-ticker.C:
+			// 发送心跳注释，防止某些反向代理（如 Nginx）断开连接
+			fmt.Fprintf(w, ": ping\n\n")
+			flusher.Flush()
+		case event := <-ch:
+			// 收到业务事件，发送给客户端
+			// 标准格式：data: {"key":"test","value":"new"}\n\n
+			fmt.Fprintf(w, "data: %s\n\n", event.JSON())
+			flusher.Flush()
+		}
+	}
 }
