@@ -13,6 +13,7 @@ import (
 	"mini-etcd/internal/storage"
 	"mini-etcd/internal/transport"
 	"mini-etcd/internal/types"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,11 +48,13 @@ type Server struct {
 	stopOnce sync.Once
 
 	// key -> []chan string，按 key 注册的监听器列表。每条变更日志应用后会通知所有监听器。
-	watchChannels sync.Map
+	watchMu             sync.RWMutex                 // 保护 watchChannels 的并发访问
+	exactWatchChannels  map[string][]chan mvcc.Event // 精确匹配的 key 监听器
+	prefixWatchChannels map[string][]chan mvcc.Event // 前缀匹配的 key 监听器
 }
 
 // NewServer 创建一个新的 Server 实例
-func NewServer(cfg config.Config, storage *storage.WAL, trans *transport.TCPTransport, applier *apply.Applier, mvcc *mvcc.MVCC) *Server {
+func NewServer(cfg config.Config, storage *storage.WAL, trans *transport.TCPTransport, applier *apply.Applier, kvstore *mvcc.MVCC) *Server {
 	// 创建 RaftNode 实例
 	rn := raftnode.NewRaftNode(cfg, storage, trans, applier)
 
@@ -66,15 +69,17 @@ func NewServer(cfg config.Config, storage *storage.WAL, trans *transport.TCPTran
 	}
 
 	s := &Server{
-		Cfg:       cfg,
-		Rn:        rn,
-		trans:     trans,
-		storage:   storage,
-		Applier:   applier,
-		mvcc:      mvcc,
-		httpPeers: httpPeers,
-		members:   members,
-		stopc:     make(chan struct{}),
+		Cfg:                 cfg,
+		Rn:                  rn,
+		trans:               trans,
+		storage:             storage,
+		Applier:             applier,
+		mvcc:                kvstore,
+		httpPeers:           httpPeers,
+		members:             members,
+		stopc:               make(chan struct{}),
+		exactWatchChannels:  make(map[string][]chan mvcc.Event),
+		prefixWatchChannels: make(map[string][]chan mvcc.Event),
 	}
 
 	// 每条配置变更日志被应用后，所有节点都会同步更新成员表并落盘。
@@ -347,49 +352,83 @@ func (s *Server) HandleRemoveMember(id uint64) error {
 // Watch 注册一个监听器，返回一个 channel，客户端可以从中接收指定 key 的变更事件。
 // 监听器是按 key 注册的，客户端可以注册多个 key 的监听器。
 // 返回的 channel 是带缓冲的，防止客户端处理太慢阻塞 Apply。
-func (s *Server) Watch(key string) chan mvcc.Event {
+func (s *Server) Watch(key string, isPrefix bool) chan mvcc.Event {
 	// 创建 channel
 	ch := make(chan mvcc.Event, 100)
 
-	// 获取 key 对应的监听器列表，如果不存在则创建一个空列表
-	actual, _ := s.watchChannels.LoadOrStore(key, make([]chan mvcc.Event, 0))
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
 
-	// 将新 channel 添加到监听器列表并存储回 sync.Map
-	chans := actual.([]chan mvcc.Event)
-	s.watchChannels.Store(key, append(chans, ch))
+	if isPrefix {
+		// 如果是前缀匹配，存储在 prefixWatchChannels 中
+		s.prefixWatchChannels[key] = append(s.prefixWatchChannels[key], ch)
+	} else {
+		// 如果是精确匹配，存储在 exactWatchChannels 中
+		s.exactWatchChannels[key] = append(s.exactWatchChannels[key], ch)
+	}
+
+	// 返回 channel，用于接受事件通知和注销监听器
 	return ch
 }
 
 // Unwatch 注销一个监听器，停止接收指定 key 的变更事件。
-func (s *Server) Unwatch(key string, ch chan mvcc.Event) {
-	if actual, ok := s.watchChannels.Load(key); ok {
-		chans := actual.([]chan mvcc.Event)
-		for i, c := range chans {
-			if c == ch {
-				chans = append(chans[:i], chans[i+1:]...) // 从切片中移除 channel
-				break
-			}
+func (s *Server) Unwatch(key string, ch chan mvcc.Event, isPrefix bool) {
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
+
+	// 根据 isPrefix 决定从哪个 map 中注销 channel
+	targetMap := s.exactWatchChannels
+	if isPrefix {
+		targetMap = s.prefixWatchChannels
+	}
+
+	chans, ok := targetMap[key]
+	if !ok {
+		return // 没有注册过这个 key，直接返回
+	}
+	for i, c := range chans {
+		if c == ch {
+			// 找到要注销的 channel，移除它
+			targetMap[key] = append(chans[:i], chans[i+1:]...)
+			close(ch) // 关闭 channel，通知客户端停止接收事件
+			break
 		}
-		// 如果移除后列表为空，则从 sync.Map 中删除该 key，否则更新列表
-		if len(chans) == 0 {
-			s.watchChannels.Delete(key)
-		} else {
-			s.watchChannels.Store(key, chans)
-		}
+	}
+
+	if len(targetMap[key]) == 0 {
+		// 如果没有剩余的 channel，删除这个 key 的 []chan
+		delete(targetMap, key)
 	}
 }
 
 // 通知（由 apply 层调用）
 func (s *Server) Notify(key string, event mvcc.Event) {
-	if actual, ok := s.watchChannels.Load(key); ok {
-		for _, ch := range actual.([]chan mvcc.Event) {
-			select {
-			case ch <- event:
-			default:
-				// 如果 ch 满了，说明客户端处理太慢，直接丢弃事件并踢掉客户端
-				// 这里先简单地打印日志，后续可以加入踢掉客户端的逻辑
-				log.Printf("[Node %d] Watch channel for key %q is full, dropping event and closing channel", s.Cfg.ID, key)
-			}
+	s.watchMu.Lock()
+	defer s.watchMu.Unlock()
+
+	// 1. 精确匹配
+	if chans, ok := s.exactWatchChannels[key]; ok {
+		s.broadcast(chans, event)
+	}
+
+	// 2. 前缀匹配：遍历所有的 prefix 规则，判断 key 是否以它开头
+	// 只适应前缀订阅不多的情况。如果前缀订阅非常多，这里会成为性能瓶颈
+	// 可以考虑用 Trie 树或前缀哈希表来优化匹配效率。
+	for prefix, chans := range s.prefixWatchChannels {
+		if strings.HasPrefix(key, prefix) {
+			s.broadcast(chans, event)
+		}
+	}
+}
+
+// broadcast 向所有监听器发送事件，如果 channel 满了就丢弃事件，避免阻塞
+func (s *Server) broadcast(chans []chan mvcc.Event, event mvcc.Event) {
+	for _, ch := range chans {
+		select {
+		case ch <- event:
+		default:
+			// 客户端处理太慢，丢弃事件
+			log.Printf("[Node %d] watch channel full, dropping event for key %s", s.Cfg.ID, event.Key)
 		}
 	}
 }

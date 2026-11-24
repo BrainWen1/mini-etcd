@@ -424,10 +424,11 @@ func (h *HTTPServer) handleWatch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	key := r.URL.Query().Get("key")
+	isPrefix := r.URL.Query().Get("prefix") == "true" // 是否按前缀订阅
 
 	// 2. 注册 Channel，拿到接收事件的通道
-	ch := h.srv.Watch(key)
-	defer h.srv.Unwatch(key, ch) // 客户端断开时清理
+	ch := h.srv.Watch(key, isPrefix)
+	defer h.srv.Unwatch(key, ch, isPrefix) // 客户端断开时清理
 
 	// 3. 启动心跳 ticker，防止反向代理断开连接
 	ticker := time.NewTicker(15 * time.Second)
