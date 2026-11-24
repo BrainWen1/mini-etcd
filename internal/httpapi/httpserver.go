@@ -425,10 +425,32 @@ func (h *HTTPServer) handleWatch(w http.ResponseWriter, r *http.Request) {
 
 	key := r.URL.Query().Get("key")
 	isPrefix := r.URL.Query().Get("prefix") == "true" // 是否按前缀订阅
+	startRevStr := r.URL.Query().Get("start_rev")
+
+	// 解析 start_rev 参数
+	var startRev uint64 = 0
+	if startRevStr != "" {
+		startRev, _ = strconv.ParseUint(startRevStr, 10, 64)
+	}
 
 	// 2. 注册 Channel，拿到接收事件的通道
+	// 注意：要先注册 Channel，再查询历史事件，否则可能漏掉刚好在查询和注册之间发生的事件
 	ch := h.srv.Watch(key, isPrefix)
 	defer h.srv.Unwatch(key, ch, isPrefix) // 客户端断开时清理
+
+	// 3. 如果指定了 start_rev，先获取历史事件并发送给客户
+	if startRev > 0 {
+		history, err := h.srv.GetHistory(key, isPrefix, startRev)
+		if err != nil {
+			log.Printf("Failed to get watch history: %v", err)
+			return
+		}
+		// 补发历史事件
+		for _, event := range history {
+			fmt.Fprintf(w, "data: %s\n\n", event.JSON())
+			flusher.Flush()
+		}
+	}
 
 	// 3. 启动心跳 ticker，防止反向代理断开连接
 	ticker := time.NewTicker(15 * time.Second)

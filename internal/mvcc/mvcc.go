@@ -11,6 +11,7 @@ import (
 	"mini-etcd/internal/backend"
 	"mini-etcd/internal/config"
 	"mini-etcd/internal/types"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -827,4 +828,62 @@ func putMetaUint64(tx backend.WriteTx, key string, val uint64) error {
 	buf := make([]byte, 8)
 	binary.BigEndian.PutUint64(buf, val)
 	return tx.Put(backend.MetaBucket, []byte(key), buf)
+}
+
+// GetHistory 查询指定 revision 之后的历史事件（供 Watch 断线重连补发）
+func (m *MVCC) GetHistory(key string, isPrefix bool, startRev uint64) ([]Event, error) {
+	var events []Event
+
+	// 开启只读事务，遍历 Data 桶，收集指定 key 的历史事件
+	err := m.be.View(func(tx backend.ReadTx) error {
+		// 获取 Data 桶的游标
+		c := tx.GetCursor(backend.DataBucket)
+		if c == nil {
+			return nil
+		}
+
+		// 如果是精确匹配，直接用 key 前缀去 Seek，提高效率
+		// 如果是前缀匹配，就用用户传的 prefix 去 Seek
+		seekPrefix := key
+		if !isPrefix {
+			// 精确匹配时，key 后面加上 \x00，避免把其它 key 的历史版本也匹配到
+			seekPrefix = key + "\x00"
+		}
+		prefixBytes := []byte(seekPrefix)
+
+		k, v := c.Seek(prefixBytes)
+		for k != nil && bytes.HasPrefix(k, prefixBytes) {
+			// 解析出真正的 key 和 rev
+			origKey, rev := parseKeyAndRevision(k)
+
+			// 注意：如果是前缀匹配，parseKeyAndRevision 可能把 "/user/1\x00rev" 解析为 key="/user/1", rev=rev
+			if rev > startRev {
+				isDelete := bytes.Equal(v, TombstoneValue)
+				evType := "PUT"
+				valStr := string(v)
+				if isDelete {
+					evType = "DELETE"
+					valStr = ""
+				}
+				events = append(events, Event{
+					Type:     evType,
+					Key:      origKey,
+					Value:    valStr,
+					Revision: rev,
+				})
+			}
+			k, v = c.Next()
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// 因为 bbolt 是按 key 排序的，事件可能是乱序的，必须按 Revision 升序排列
+	sort.Slice(events, func(i, j int) bool {
+		return events[i].Revision < events[j].Revision
+	})
+
+	return events, nil
 }
