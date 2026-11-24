@@ -432,3 +432,9 @@ func (s *Server) broadcast(chans []chan mvcc.Event, event mvcc.Event) {
 		}
 	}
 }
+
+// GetHistory 返回指定 key 的历史变更事件列表，从 startRev 开始（包含 startRev）。
+// 如果 isPrefix 为 true，则返回所有以 key 为前缀的历史事件。
+func (s *Server) GetHistory(key string, isPrefix bool, startRev uint64) ([]mvcc.Event, error) {
+	return s.mvcc.GetHistory(key, isPrefix, startRev) // 直接调用 MVCC 的 GetHistory 方法
+}
