@@ -3,6 +3,7 @@ module mini-etcd
 go 1.26.3
 
 require (
+	github.com/bwmarrin/snowflake v0.3.0
 	go.etcd.io/bbolt v1.5.0
 	go.etcd.io/etcd/raft/v3 v3.5.35
 )

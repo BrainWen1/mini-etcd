@@ -3,10 +3,12 @@ package raftnode
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"log"
 	"maps"
 	"mini-etcd/internal/config"
+	"mini-etcd/internal/types"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -49,6 +51,8 @@ type Applier interface {
 	UpsertMember(id uint64, raftAddr, httpAddr string) (config.Member, error)
 	RemoveMember(id uint64) error
 	GetMembers() (map[uint64]config.Member, error)
+
+	GetExpiredLeases() ([]int64, error) // 扫描状态机里过期的 LeaseID
 }
 
 // MembershipChangeHandler 在一条配置变更日志被本地应用后回调。
@@ -785,4 +789,51 @@ func (rn *RaftNode) resolveReadIndexLocked(key string) {
 	}
 	batch.resolved = true
 	close(batch.done) // 关闭而不是发送：状态机已追平，等 done 的读方可以安全读取
+}
+
+// leaseExpiryCheckInterval 是 leaseExpiryLoop 扫描过期 LeaseID 的间隔。
+const leaseExpiryCheckInterval = 2 * time.Second
+
+// leaseExpiryLoop 定期扫描状态机里过期的 LeaseID，并向 Raft 提交 Revoke 命令。
+func (rn *RaftNode) leaseExpiryLoop(stopc <-chan struct{}) {
+	ticker := time.NewTicker(leaseExpiryCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stopc:
+			return
+		case <-ticker.C:
+			// 1. 只有 Leader 才有资格发起检查
+			rn.mu.RLock()
+			isLeader := rn.leaderID == rn.nodeID
+			rn.mu.RUnlock()
+			if !isLeader {
+				// 如果不是 Leader，跳过本次检查
+				// 这些跳过的轮次不会影响过期 LeaseID 的最终回收，因为 Leader 会在自己的轮次里扫描到
+				// 过期的 LeaseID 并提交 Revoke 命令，Follower 会在收到 Revoke 日志后应用它们。
+				// 另外，Leader 可能在本轮检查前就已经提交了 Revoke 命令，Follower 会在应用日志时回收 LeaseID。
+				// 至于 Follower 也要一直循环尝试扫描过期 LeaseID，是因为当前 Leader 是有可能下台的，Follower 也可能在下一轮成为 Leader，继续扫描过期 LeaseID 并提交 Revoke 命令。
+				continue
+			}
+
+			// 2. 从 MVCC 扫描出所有过期的 LeaseID
+			expiredIDs, err := rn.applier.GetExpiredLeases()
+			if err != nil {
+				continue
+			}
+
+			// 3. 将过期的 LeaseID 打包成 Revoke 命令，提交给 Raft
+			for _, leaseID := range expiredIDs {
+				cmd := types.LeaseCommand{
+					RequestID: fmt.Sprintf("revoke-%d-%d", leaseID, time.Now().UnixNano()),
+					Op:        types.OpLeaseRevoke,
+					LeaseID:   leaseID,
+				}
+				data, _ := json.Marshal(cmd)
+				// 异步 Propose，不阻塞 ticker
+				go rn.Node.Propose(context.Background(), data)
+			}
+		}
+	}
 }

@@ -36,7 +36,11 @@ func (h *HTTPServer) Start(port string) error {
 	mux.HandleFunc("DELETE /v1/kv/{key}", h.handleDelete)
 	mux.HandleFunc("GET /v1/kv/range", h.handleRange)
 	mux.HandleFunc("POST /v1/kv/txn", h.handleTxn)
+
 	mux.HandleFunc("GET /v1/kv/watch", h.handleWatch)
+	mux.HandleFunc("POST /v1/lease/grant", h.handleLeaseGrant)
+	mux.HandleFunc("POST /v1/lease/revoke", h.handleLeaseRevoke)
+	mux.HandleFunc("POST /v1/lease/keepalive", h.handleLeaseKeepAlive)
 
 	// 动态成员管理：写请求同样需要代理到 Leader（配置变更必须由 Leader 提议）
 	mux.HandleFunc("POST /v1/cluster/members/add", h.handleAddMember)
@@ -48,8 +52,9 @@ func (h *HTTPServer) Start(port string) error {
 
 // 定义请求和响应的 JSON 结构体
 type PutRequest struct {
-	Key   string `json:"key"`
-	Value string `json:"value"`
+	Key     string `json:"key"`
+	Value   string `json:"value"`
+	LeaseID int64  `json:"lease_id,omitempty"` // 可选字段，绑定的 LeaseID
 }
 
 type GetResponse struct {
@@ -72,6 +77,14 @@ type TxnRequest struct {
 	Compares []types.Compare   `json:"compares"`
 	Success  []types.Operation `json:"success"`
 	Failure  []types.Operation `json:"failure"`
+}
+
+// TxnResponse 是事务响应体。
+// succeeded 表示事务是否走了 success 分支：分布式锁用 compares 判断锁是否空闲，
+// 客户端必须看这个字段（而不是 HTTP 200）才知道自己有没有抢到锁。
+type TxnResponse struct {
+	Status    string `json:"status"`
+	Succeeded bool   `json:"succeeded"`
 }
 
 // validateTxnKeys 对事务中所有 key 做与 PUT/DELETE 相同的校验：
@@ -129,8 +142,9 @@ func (h *HTTPServer) handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 调用底层的 HandlePut（同步等待落盘）
-	if err := h.srv.HandlePut(req.Key, req.Value); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	res := h.srv.HandlePut(req.Key, req.Value, req.LeaseID)
+	if res.Err != nil {
+		writeError(w, http.StatusInternalServerError, res.Err.Error())
 		return
 	}
 
@@ -210,8 +224,9 @@ func (h *HTTPServer) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 调用底层的 HandleDelete（同步等待落盘）
-	if err := h.srv.HandleDelete(key); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	res := h.srv.HandleDelete(key)
+	if res.Err != nil {
+		writeError(w, http.StatusInternalServerError, res.Err.Error())
 		return
 	}
 
@@ -288,14 +303,18 @@ func (h *HTTPServer) handleTxn(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 调用底层的 HandleTxn（同步等待落盘）
-	if err := h.srv.HandleTxn(req.Compares, req.Success, req.Failure); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	res := h.srv.HandleTxn(req.Compares, req.Success, req.Failure)
+	if res.Err != nil {
+		writeError(w, http.StatusInternalServerError, res.Err.Error())
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	json.NewEncoder(w).Encode(TxnResponse{
+		Status:    "success",
+		Succeeded: res.Succeeded,
+	})
 }
 
 // proxyToLeader 检查当前节点是否是 Leader，如果不是，则将请求代理到 Leader 节点。
@@ -473,4 +492,96 @@ func (h *HTTPServer) handleWatch(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// handleLeaseGrant 处理 POST /v1/lease/grant，创建一个新的 Lease
+func (h *HTTPServer) handleLeaseGrant(w http.ResponseWriter, r *http.Request) {
+	if h.proxyToLeader(w, r) {
+		return // 请求被代理到 Leader，当前节点不再处理
+	}
+	// 当前节点是 Leader，继续处理请求
+
+	var req struct {
+		TTL int64 `json:"ttl"` // TTL 单位为秒
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if req.TTL <= 0 {
+		writeError(w, http.StatusBadRequest, "ttl must be positive")
+		return
+	}
+
+	leaseID, res := h.srv.HandleLeaseGrant(req.TTL)
+	if res.Err != nil {
+		writeError(w, http.StatusInternalServerError, res.Err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"lease_id": leaseID,
+	})
+}
+
+// handleLeaseRevoke 处理 POST /v1/lease/revoke，撤销一个 Lease
+func (h *HTTPServer) handleLeaseRevoke(w http.ResponseWriter, r *http.Request) {
+	if h.proxyToLeader(w, r) {
+		return // 请求被代理到 Leader，当前节点不再处理
+	}
+	// 当前节点是 Leader，继续处理请求
+
+	var req struct {
+		LeaseID int64 `json:"lease_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if req.LeaseID <= 0 {
+		writeError(w, http.StatusBadRequest, "lease_id must be positive")
+		return
+	}
+
+	res := h.srv.HandleLeaseRevoke(req.LeaseID)
+	if res.Err != nil {
+		writeError(w, http.StatusInternalServerError, res.Err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+}
+
+// handleLeaseKeepAlive 处理 POST /v1/lease/keepalive，续租一个 Lease
+func (h *HTTPServer) handleLeaseKeepAlive(w http.ResponseWriter, r *http.Request) {
+	if h.proxyToLeader(w, r) {
+		return // 请求被代理到 Leader，当前节点不再处理
+	}
+	// 当前节点是 Leader，继续处理请求
+
+	var req struct {
+		LeaseID int64 `json:"lease_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if req.LeaseID <= 0 {
+		writeError(w, http.StatusBadRequest, "lease_id must be positive")
+		return
+	}
+
+	res := h.srv.HandleLeaseKeepAlive(req.LeaseID)
+	if res.Err != nil {
+		writeError(w, http.StatusInternalServerError, res.Err.Error())
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
 }

@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bwmarrin/snowflake"
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
@@ -35,6 +36,11 @@ type Server struct {
 	// 不能用 time.Now().UnixNano()：高并发下可能取到相同值，导致 waiter 的 key 冲突，
 	// 轻则某个请求一直等到超时，重则客户端收到另一个请求的执行结果。
 	reqSeq atomic.Uint64
+
+	// snowflakeNode 用于生成全局唯一的 LeaseID。
+	// 必须整个进程复用一个实例：NewNode 每次都从 step=0 开始，同一毫秒内
+	// 新建两个节点会生成完全相同的 ID，两个租约互相覆盖。
+	snowflakeNode *snowflake.Node
 
 	// 动态成员信息。
 	// httpPeers 是 Leader 代理用的地址表：必须和 Raft 成员变更同步更新，
@@ -68,6 +74,13 @@ func NewServer(cfg config.Config, storage *storage.WAL, trans *transport.TCPTran
 		members[id] = config.Member{ID: id, RaftAddr: raftAddr, HTTPAddr: cfg.HTTPPeers[id]}
 	}
 
+	// snowflake 节点 ID 只支持 0-1023；配置的节点 ID 超出范围时无法生成 LeaseID，
+	// 这是部署配置错误，启动阶段直接失败比运行期静默返回 0 更好排查。
+	snowflakeNode, err := snowflake.NewNode(int64(cfg.ID))
+	if err != nil {
+		log.Fatalf("创建 snowflake 节点失败 (node id %d): %v", cfg.ID, err)
+	}
+
 	s := &Server{
 		Cfg:                 cfg,
 		Rn:                  rn,
@@ -75,6 +88,7 @@ func NewServer(cfg config.Config, storage *storage.WAL, trans *transport.TCPTran
 		storage:             storage,
 		Applier:             applier,
 		mvcc:                kvstore,
+		snowflakeNode:       snowflakeNode,
 		httpPeers:           httpPeers,
 		members:             members,
 		stopc:               make(chan struct{}),
@@ -137,7 +151,7 @@ func (s *Server) nextRequestID() string {
 
 // proposeAndWait 把命令提交给 Raft，并阻塞等待状态机应用完成。
 // 调用方必须先用 nextRequestID 生成 reqID，并用同一个 reqID 编码命令。
-func (s *Server) proposeAndWait(reqID string, cmd []byte) error {
+func (s *Server) proposeAndWait(reqID string, cmd []byte) types.Result {
 	// 1. 先注册 waiter，再提交；顺序反过来的话 Apply 可能先于注册完成，客户端会一直等到超时
 	waitCh := s.Applier.RegisterWaiter(reqID)
 
@@ -148,26 +162,57 @@ func (s *Server) proposeAndWait(reqID string, cmd []byte) error {
 	if err != nil {
 		// 如果提议失败（比如超时或节点不是 Leader），要把 waiter 清理掉
 		s.Applier.RemoveWaiter(reqID)
-		return fmt.Errorf("propose failed: %w", err)
+		return types.Result{Succeeded: false, Err: err}
 	}
 
 	// 3. 阻塞等待 Raft 应用结果
 	// 这里也要设置超时，防止 Raft 迟迟不 Apply
 	select {
-	case applyErr := <-waitCh:
-		return applyErr // 返回应用结果，可能是 nil 或者具体的错误
+	case res := <-waitCh:
+		return res // 返回应用结果给客户端
 	case <-time.After(5 * time.Second): // 超时兜底
 		s.Applier.RemoveWaiter(reqID)
-		return errors.New("timeout waiting for apply")
+		return types.Result{Succeeded: false, Err: errors.New("apply timeout")}
 	}
 }
 
+// validateLeases 确认请求引用的租约仍然存在。
+//
+// 必须在提议前校验：如果一条 PUT 带着已经不存在的 LeaseID 进入 Raft 日志，
+// 各节点在 Apply 时无法为它建立绑定，key 会永远不随租约过期而被回收。
+// 先过 readBarrier 再读本地状态，避免刚当选的 Leader 状态机尚未追平，
+// 把仍然存在的租约误判为不存在。
+func (s *Server) validateLeases(leaseIDs []int64) error {
+	if len(leaseIDs) == 0 {
+		return nil
+	}
+	// 先追平本地状态机，避免 Follower 还没应用完 Leader 的日志就读本地状态。
+	if err := s.readBarrier(); err != nil {
+		return err
+	}
+	for _, leaseID := range leaseIDs {
+		ok, err := s.mvcc.LeaseExists(leaseID)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("lease %d not found", leaseID)
+		}
+	}
+	return nil
+}
+
 // HandlePut 处理客户端的 PUT 请求，提交给 Raft 提议
-func (s *Server) HandlePut(key, value string) error {
+func (s *Server) HandlePut(key, value string, leaseID int64) types.Result {
+	if leaseID > 0 {
+		if err := s.validateLeases([]int64{leaseID}); err != nil {
+			return types.Result{Succeeded: false, Err: err}
+		}
+	}
 	reqID := s.nextRequestID()
-	cmd, err := types.EncodePutCommand(reqID, key, value)
+	cmd, err := types.EncodePutCommand(reqID, key, value, leaseID)
 	if err != nil {
-		return fmt.Errorf("encode command failed: %w", err)
+		return types.Result{Succeeded: false, Err: fmt.Errorf("encode command failed: %w", err)}
 	}
 	return s.proposeAndWait(reqID, cmd)
 }
@@ -208,18 +253,18 @@ func (s *Server) HandleGetAtRevision(key string, rev uint64) (string, error) {
 }
 
 // HandleDelete 处理客户端的 DELETE 请求，提交给 Raft 提议
-func (s *Server) HandleDelete(key string) error {
+func (s *Server) HandleDelete(key string) types.Result {
 	reqID := s.nextRequestID()
 	cmd, err := types.EncodeDeleteCommand(reqID, key)
 	if err != nil {
-		return fmt.Errorf("encode command failed: %w", err)
+		return types.Result{Succeeded: false, Err: fmt.Errorf("encode command failed: %w", err)}
 	}
 	return s.proposeAndWait(reqID, cmd)
 }
 
 // HandleTxn 处理客户端的 TXN 请求：提交事务命令，由状态机在 Apply 时
 // 在同一 bbolt 事务中评估 compares 并执行 success/failure 分支。
-func (s *Server) HandleTxn(compares []types.Compare, success, failure []types.Operation) error {
+func (s *Server) HandleTxn(compares []types.Compare, success, failure []types.Operation) types.Result {
 	txnCmd := types.TxnCommand{
 		RequestID: s.nextRequestID(),
 		Compares:  compares,
@@ -228,11 +273,23 @@ func (s *Server) HandleTxn(compares []types.Compare, success, failure []types.Op
 	}
 	// 写进 Raft 日志前先校验：非法命令一旦进入日志，每次重放都会失败
 	if err := types.ValidateTxnCommand(txnCmd); err != nil {
-		return fmt.Errorf("invalid txn: %w", err)
+		return types.Result{Succeeded: false, Err: fmt.Errorf("invalid txn: %w", err)}
+	}
+	// 同样在提议前确认事务引用的租约都存在
+	var leaseIDs []int64
+	for _, ops := range [][]types.Operation{success, failure} {
+		for _, op := range ops {
+			if op.LeaseID > 0 {
+				leaseIDs = append(leaseIDs, op.LeaseID)
+			}
+		}
+	}
+	if err := s.validateLeases(leaseIDs); err != nil {
+		return types.Result{Succeeded: false, Err: err}
 	}
 	cmd, err := types.EncodeTxnCommand(txnCmd)
 	if err != nil {
-		return fmt.Errorf("encode command failed: %w", err)
+		return types.Result{Succeeded: false, Err: fmt.Errorf("encode command failed: %w", err)}
 	}
 	return s.proposeAndWait(txnCmd.RequestID, cmd)
 }
@@ -401,8 +458,8 @@ func (s *Server) Unwatch(key string, ch chan mvcc.Event, isPrefix bool) {
 	}
 }
 
-// 通知（由 apply 层调用）
-func (s *Server) Notify(key string, event mvcc.Event) {
+// NotifyWatcher 通知所有匹配的 Watch 监听器（由 apply 层通过 WatchNotifier 接口调用）
+func (s *Server) NotifyWatcher(key string, event mvcc.Event) {
 	s.watchMu.Lock()
 	defer s.watchMu.Unlock()
 
@@ -437,4 +494,57 @@ func (s *Server) broadcast(chans []chan mvcc.Event, event mvcc.Event) {
 // 如果 isPrefix 为 true，则返回所有以 key 为前缀的历史事件。
 func (s *Server) GetHistory(key string, isPrefix bool, startRev uint64) ([]mvcc.Event, error) {
 	return s.mvcc.GetHistory(key, isPrefix, startRev) // 直接调用 MVCC 的 GetHistory 方法
+}
+
+// HandleLeaseGrant 处理客户端的 LeaseGrant 请求，提交给 Raft 提议
+func (s *Server) HandleLeaseGrant(ttl int64) (int64, types.Result) {
+	reqID := s.nextRequestID()
+	leaseID := s.snowflakeNode.Generate().Int64() // 使用雪花算法生成唯一的 LeaseID
+	if leaseID <= 0 {
+		return 0, types.Result{Succeeded: false, Err: errors.New("failed to generate lease id")}
+	}
+	cmd, err := types.EncodeLeaseCommand(types.LeaseCommand{
+		RequestID: reqID,
+		Op:        types.OpLeaseGrant,
+		LeaseID:   leaseID,
+		TTL:       ttl,
+		// 开始时间由 Leader 在提议前打戳：所有节点都用 LeaseStart+TTL 计算过期时间，
+		// 保证同一条日志在各节点得到相同结果（不能在各节点 Apply 时调用 time.Now()）。
+		LeaseStart: time.Now().Unix(),
+	})
+	if err != nil {
+		return 0, types.Result{Succeeded: false, Err: fmt.Errorf("encode command failed: %w", err)}
+	}
+	return leaseID, s.proposeAndWait(reqID, cmd)
+}
+
+// HandleLeaseRevoke 处理客户端的 LeaseRevoke 请求，提交给 Raft 提议
+func (s *Server) HandleLeaseRevoke(leaseID int64) types.Result {
+	reqID := s.nextRequestID()
+	cmd, err := types.EncodeLeaseCommand(types.LeaseCommand{
+		RequestID: reqID,
+		Op:        types.OpLeaseRevoke,
+		LeaseID:   leaseID,
+	})
+
+	if err != nil {
+		return types.Result{Succeeded: false, Err: fmt.Errorf("encode command failed: %w", err)}
+	}
+	return s.proposeAndWait(reqID, cmd)
+}
+
+// HandleLeaseKeepAlive 处理客户端的 LeaseKeepAlive 请求，提交给 Raft 提议
+func (s *Server) HandleLeaseKeepAlive(leaseID int64) types.Result {
+	reqID := s.nextRequestID()
+	cmd, err := types.EncodeLeaseCommand(types.LeaseCommand{
+		RequestID: reqID,
+		Op:        types.OpLeaseKeepAlive,
+		LeaseID:   leaseID,
+		// 续租只更新时间戳；TTL 由状态机提供，过期时间 = LeaseStart + TTL。
+		LeaseStart: time.Now().Unix(),
+	})
+	if err != nil {
+		return types.Result{Succeeded: false, Err: fmt.Errorf("encode command failed: %w", err)}
+	}
+	return s.proposeAndWait(reqID, cmd)
 }

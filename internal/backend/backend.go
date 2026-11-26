@@ -14,6 +14,10 @@ var (
 	MetaBucket         = []byte("meta")          // 存 consistentIndex, revision 等元数据 ("RevisionKey" -> "67")
 	DataBucket         = []byte("data")          // 存带 revision 的 KV 数据 ("key_RevisionKey" -> "mini-etcd")
 	DataRevisionBucket = []byte("data_revision") // 存每个 key 的 revision ("key" -> "67")
+
+	LeaseBucket       = []byte("lease")         // LeaseID -> [TTL(8字节) + ExpireTime(8字节)]
+	LeaseKeyBucket    = []byte("lease_key")     // LeaseID -> JSON序列化的 []string (绑定的 Key 列表)
+	LeaseKeyRevBucket = []byte("lease_key_rev") // Key -> LeaseID(8字节)，用于删除/改绑时反查所属租约
 )
 
 const (
@@ -46,7 +50,7 @@ func NewBackend(path string) (*Backend, error) {
 		return nil, err
 	}
 
-	// 初始化：确保三个 Bucket 存在
+	// 初始化：确保所有 Bucket 存在
 	err = db.Update(func(tx *bbolt.Tx) error {
 		// 如果 Bucket 不存在就创建，存在就返回已存在的 Bucket
 		if _, err := tx.CreateBucketIfNotExists(MetaBucket); err != nil {
@@ -59,6 +63,18 @@ func NewBackend(path string) (*Backend, error) {
 		}
 		if _, err := tx.CreateBucketIfNotExists(DataRevisionBucket); err != nil {
 			log.Printf("Failed to create DataRevision bucket: %v", err)
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists(LeaseBucket); err != nil {
+			log.Printf("Failed to create Lease bucket: %v", err)
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists(LeaseKeyBucket); err != nil {
+			log.Printf("Failed to create LeaseKey bucket: %v", err)
+			return err
+		}
+		if _, err := tx.CreateBucketIfNotExists(LeaseKeyRevBucket); err != nil {
+			log.Printf("Failed to create LeaseKeyRev bucket: %v", err)
 			return err
 		}
 		return nil

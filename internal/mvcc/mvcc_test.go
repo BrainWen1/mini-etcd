@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"testing"
+	"time"
 
 	"mini-etcd/internal/backend"
 	"mini-etcd/internal/types"
@@ -395,5 +396,182 @@ func TestGetAtRevisionIgnoresOtherKeysWithNUL(t *testing.T) {
 	}
 	if got != "mine" {
 		t.Fatalf(`GetAtRevision(a) = %q, want %q (读到了 "a\x00b" 的值)`, got, "mine")
+	}
+}
+
+// putWithLease 通过 ApplyBatch 写入一个绑定租约的 key（MVCC.Put 不接受 LeaseID）。
+func putWithLease(t *testing.T, m *MVCC, key, value string, leaseID int64, index uint64) {
+	t.Helper()
+	if _, _, err := m.ApplyBatch([]Entry{{Index: index, Op: "PUT", Key: key, Value: value, LeaseID: leaseID}}); err != nil {
+		t.Fatalf("ApplyBatch(PUT %s, lease=%d, index=%d): %v", key, leaseID, index, err)
+	}
+}
+
+// TestLeaseRevokeDeletesAllBoundKeys 验证撤销租约时会删除它绑定的**所有** key。
+//
+// 早期实现里每个 key 都走 applyPut 的幂等检查：第一个 key 写完墓碑后
+// consistentIndex 就等于 Revoke 日志的索引，后续 key 会被误判为“已应用”
+// 而全部跳过，导致只有第一个 key 被删除。
+func TestLeaseRevokeDeletesAllBoundKeys(t *testing.T) {
+	m := newTestMVCC(t)
+
+	if err := m.GrantLease(100, 60, time.Now().Unix(), 1); err != nil {
+		t.Fatalf("GrantLease: %v", err)
+	}
+	putWithLease(t, m, "a", "1", 100, 2)
+	putWithLease(t, m, "b", "2", 100, 3)
+
+	if _, err := m.RevokeLease(100, 4); err != nil {
+		t.Fatalf("RevokeLease: %v", err)
+	}
+
+	for _, key := range []string{"a", "b"} {
+		if _, err := m.Get(key); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("Get(%s) error = %v, want ErrKeyNotFound（租约撤销后 key 应被删除）", key, err)
+		}
+	}
+	if ok, err := m.LeaseExists(100); err != nil || ok {
+		t.Fatalf("LeaseExists(100) = %v, %v; want false, nil", ok, err)
+	}
+}
+
+// TestLeaseRebindDoesNotDeleteKeyWhenOldLeaseExpires 验证 key 改绑到新租约后，
+// 旧租约过期/撤销不会把它一并删除。
+func TestLeaseRebindDoesNotDeleteKeyWhenOldLeaseExpires(t *testing.T) {
+	m := newTestMVCC(t)
+
+	if err := m.GrantLease(100, 60, time.Now().Unix(), 1); err != nil {
+		t.Fatalf("GrantLease(100): %v", err)
+	}
+	if err := m.GrantLease(200, 60, time.Now().Unix(), 2); err != nil {
+		t.Fatalf("GrantLease(200): %v", err)
+	}
+	putWithLease(t, m, "k", "old", 100, 3)
+	putWithLease(t, m, "k", "new", 200, 4)
+
+	if _, err := m.RevokeLease(100, 5); err != nil {
+		t.Fatalf("RevokeLease(100): %v", err)
+	}
+	got, err := m.Get("k")
+	if err != nil {
+		t.Fatalf("Get(k) after revoke old lease: %v", err)
+	}
+	if got != "new" {
+		t.Fatalf("Get(k) = %q, want %q", got, "new")
+	}
+
+	if _, err := m.RevokeLease(200, 6); err != nil {
+		t.Fatalf("RevokeLease(200): %v", err)
+	}
+	if _, err := m.Get("k"); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("Get(k) error = %v, want ErrKeyNotFound", err)
+	}
+}
+
+// TestLeaseRevokeReplayIsNoop 验证重放旧的 Revoke 日志不会删除撤销之后新写入的数据，
+// 也不会让 consistentIndex 回退。
+func TestLeaseRevokeReplayIsNoop(t *testing.T) {
+	m := newTestMVCC(t)
+
+	if err := m.GrantLease(100, 60, time.Now().Unix(), 1); err != nil {
+		t.Fatalf("GrantLease: %v", err)
+	}
+	putWithLease(t, m, "k", "old", 100, 2)
+	if _, err := m.RevokeLease(100, 3); err != nil {
+		t.Fatalf("RevokeLease: %v", err)
+	}
+	if err := m.Put("k", "new", 4); err != nil {
+		t.Fatalf("Put(k, index=4): %v", err)
+	}
+
+	// 模拟重启后重放索引 3 的 Revoke
+	if _, err := m.RevokeLease(100, 3); err != nil {
+		t.Fatalf("replay RevokeLease: %v", err)
+	}
+	got, err := m.Get("k")
+	if err != nil {
+		t.Fatalf("Get(k) after replay: %v", err)
+	}
+	if got != "new" {
+		t.Fatalf("Get(k) = %q, want %q（重放旧 Revoke 不应覆盖新值）", got, "new")
+	}
+	idx, err := m.GetConsistentIndex()
+	if err != nil {
+		t.Fatalf("GetConsistentIndex: %v", err)
+	}
+	if idx != 4 {
+		t.Fatalf("GetConsistentIndex() = %d, want 4（重放不应回退索引）", idx)
+	}
+}
+
+// TestLeaseSnapshotPreservesBindings 验证租约与 key 绑定会随快照一起复制：
+// 从快照恢复的节点在应用后续 Revoke 日志时必须删除同样的 key，否则节点间
+// 状态机会永久分歧。
+func TestLeaseSnapshotPreservesBindings(t *testing.T) {
+	src := newTestMVCC(t)
+	if err := src.GrantLease(100, 60, time.Now().Unix(), 1); err != nil {
+		t.Fatalf("GrantLease: %v", err)
+	}
+	putWithLease(t, src, "a", "1", 100, 2)
+	putWithLease(t, src, "b", "2", 100, 3)
+
+	snap, err := src.GetSnapshot()
+	if err != nil {
+		t.Fatalf("GetSnapshot: %v", err)
+	}
+
+	dst := newTestMVCC(t)
+	if err := dst.ApplySnapshot(snap); err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+	if ok, err := dst.LeaseExists(100); err != nil || !ok {
+		t.Fatalf("LeaseExists(100) after snapshot = %v, %v; want true, nil", ok, err)
+	}
+
+	// 模拟 Leader 提交的 Revoke 日志在恢复节点上应用
+	if _, err := dst.RevokeLease(100, 4); err != nil {
+		t.Fatalf("RevokeLease after snapshot: %v", err)
+	}
+	for _, key := range []string{"a", "b"} {
+		if _, err := dst.Get(key); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("Get(%s) after snapshot+revoke error = %v, want ErrKeyNotFound", key, err)
+		}
+	}
+}
+
+// TestLeaseExpiryDerivedFromLeaseStart 验证过期时间只由日志里的 LeaseStart 决定，
+// 而不是应用日志时的本地时钟。否则落后节点重放同一条 Grant 会用更晚的时钟
+// 算出更晚的过期时间，与 Leader 分歧。
+func TestLeaseExpiryDerivedFromLeaseStart(t *testing.T) {
+	m := newTestMVCC(t)
+
+	now := time.Now().Unix()
+	// 开始于 2 分钟前、TTL 60 秒：刚应用就已经过期
+	if err := m.GrantLease(300, 60, now-120, 1); err != nil {
+		t.Fatalf("GrantLease(300): %v", err)
+	}
+	// 刚刚开始：不应过期
+	if err := m.GrantLease(400, 60, now, 2); err != nil {
+		t.Fatalf("GrantLease(400): %v", err)
+	}
+
+	expired, err := m.GetExpiredLeases()
+	if err != nil {
+		t.Fatalf("GetExpiredLeases: %v", err)
+	}
+	if len(expired) != 1 || expired[0] != 300 {
+		t.Fatalf("GetExpiredLeases() = %v, want [300]", expired)
+	}
+
+	// 续租把开始时间刷新到 now，过期时间变成 now+TTL，不再过期
+	if err := m.KeepAliveLease(300, now, 3); err != nil {
+		t.Fatalf("KeepAliveLease(300): %v", err)
+	}
+	expired, err = m.GetExpiredLeases()
+	if err != nil {
+		t.Fatalf("GetExpiredLeases after keepalive: %v", err)
+	}
+	if len(expired) != 0 {
+		t.Fatalf("GetExpiredLeases() = %v, want empty", expired)
 	}
 }

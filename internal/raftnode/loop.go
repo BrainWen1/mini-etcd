@@ -23,6 +23,9 @@ func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { /
 	// 读请求聚合循环：把并发 GET 合并成一次 Raft ReadIndex，避免每个读都触发一轮心跳广播
 	go rn.readIndexLoop()
 
+	// 过期 Lease 扫描循环：定期扫描状态机里过期的 LeaseID，并向 Raft 提交 Revoke 命令
+	go rn.leaseExpiryLoop(stopc)
+
 	ticker := time.NewTicker(tickerInterval)
 	defer ticker.Stop()
 
