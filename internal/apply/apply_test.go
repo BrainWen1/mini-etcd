@@ -5,6 +5,7 @@ import (
 	"mini-etcd/internal/mvcc"
 	"mini-etcd/internal/types"
 	"testing"
+	"time"
 
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
@@ -39,7 +40,7 @@ func TestCommandRoundTripWithSpaces(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		data, err := types.EncodePutCommand("1-1", tc.key, tc.value)
+		data, err := types.EncodePutCommand("1-1", tc.key, tc.value, 0)
 		if err != nil {
 			t.Fatalf("EncodePutCommand(%q, %q): %v", tc.key, tc.value, err)
 		}
@@ -57,7 +58,7 @@ func TestCommandRoundTripWithSpaces(t *testing.T) {
 func TestApplyTxn(t *testing.T) {
 	a := newTestApplier(t)
 
-	seed, err := types.EncodePutCommand("seed", "balance", "100")
+	seed, err := types.EncodePutCommand("seed", "balance", "100", 0)
 	if err != nil {
 		t.Fatalf("EncodePutCommand: %v", err)
 	}
@@ -80,9 +81,12 @@ func TestApplyTxn(t *testing.T) {
 		t.Fatalf("Apply(txn): %v", err)
 	}
 	select {
-	case err := <-waitCh:
-		if err != nil {
-			t.Fatalf("Txn apply error = %v, want nil", err)
+	case res := <-waitCh:
+		if res.Err != nil {
+			t.Fatalf("Txn apply error = %v, want nil", res.Err)
+		}
+		if !res.Succeeded {
+			t.Fatal("compares 全部命中，Result.Succeeded 应为 true")
 		}
 	default:
 		t.Fatal("TXN 应用后没有通知等待者")
@@ -90,6 +94,56 @@ func TestApplyTxn(t *testing.T) {
 
 	if got, _ := a.Get("balance"); got != "90" {
 		t.Fatalf("balance = %q, want 90", got)
+	}
+}
+
+// TestApplyTxnReportsBranch 验证 TXN 是否走 success 分支会通过 Result.Succeeded
+// 返回给客户端：分布式锁靠它判断抢锁是否成功。
+//
+// 两个客户端用同一个 compare（lock == ""）先后抢锁：第一个成功写入，
+// 第二个的 compare 不再成立、应走 failure 分支并拿到 Succeeded=false，
+// 但两者都不能返回错误——"没抢到锁"是正常结果，不是状态机故障。
+func TestApplyTxnReportsBranch(t *testing.T) {
+	a := newTestApplier(t)
+
+	acquire := func(reqID string, index uint64) types.Result {
+		t.Helper()
+		data, err := types.EncodeTxnCommand(types.TxnCommand{
+			RequestID: reqID,
+			Compares:  []types.Compare{{Key: "lock", Op: "==", Value: ""}},
+			Success:   []types.Operation{{Op: "PUT", Key: "lock", Value: reqID}},
+		})
+		if err != nil {
+			t.Fatalf("EncodeTxnCommand(%s): %v", reqID, err)
+		}
+		waitCh := a.RegisterWaiter(reqID)
+		if err := a.Apply([]raftpb.Entry{{Index: index, Type: raftpb.EntryNormal, Data: data}}); err != nil {
+			t.Fatalf("Apply(%s): %v", reqID, err)
+		}
+		select {
+		case res := <-waitCh:
+			if res.Err != nil {
+				t.Fatalf("waiter %s got error %v, want nil", reqID, res.Err)
+			}
+			return res
+		default:
+			t.Fatalf("waiter %s 没有被通知", reqID)
+			return types.Result{}
+		}
+	}
+
+	if res := acquire("client-1", 1); !res.Succeeded {
+		t.Fatal("第一个事务的 compare 成立，Succeeded 应为 true")
+	}
+	if got, _ := a.Get("lock"); got != "client-1" {
+		t.Fatalf("lock = %q, want client-1", got)
+	}
+
+	if res := acquire("client-2", 2); res.Succeeded {
+		t.Fatal("锁已被占用，第二个事务应走 failure 分支并返回 Succeeded=false")
+	}
+	if got, _ := a.Get("lock"); got != "client-1" {
+		t.Fatalf("lock = %q, want client-1（失败分支不应改写锁）", got)
 	}
 }
 
@@ -106,8 +160,8 @@ func TestApplyUnparseableTxnNotifiesWaiter(t *testing.T) {
 		t.Fatalf("Apply(unparseable txn) = %v, want nil（跳过该日志）", err)
 	}
 	select {
-	case err := <-waitCh:
-		if err == nil {
+	case res := <-waitCh:
+		if res.Err == nil {
 			t.Fatal("无法解析的事务应通知等待者错误")
 		}
 	default:
@@ -126,7 +180,7 @@ func TestApplyInvalidTxnSkipped(t *testing.T) {
 
 	// DecodeTxnCommand 能解析，但比较运算符不受支持。
 	data := []byte(`{"request_id":"bad-2","op":"TXN","compares":[{"key":"k","op":"~=","value":"v"}],"success":[{"op":"PUT","key":"a","value":"1"}]}`)
-	put, err := types.EncodePutCommand("next", "b", "2")
+	put, err := types.EncodePutCommand("next", "b", "2", 0)
 	if err != nil {
 		t.Fatalf("EncodePutCommand: %v", err)
 	}
@@ -141,8 +195,8 @@ func TestApplyInvalidTxnSkipped(t *testing.T) {
 		t.Fatalf("Apply(batch with invalid txn) = %v, want nil（跳过该条日志）", err)
 	}
 	select {
-	case err := <-waitCh:
-		if err == nil {
+	case res := <-waitCh:
+		if res.Err == nil {
 			t.Fatal("非法事务应通知等待者错误")
 		}
 	default:
@@ -170,8 +224,8 @@ func TestApplyInvalidTxnSkipped(t *testing.T) {
 func TestApplyBatchNotifiesOnlyAfterCommit(t *testing.T) {
 	a := newTestApplier(t)
 
-	put1, _ := types.EncodePutCommand("put-1", "a", "1")
-	put2, _ := types.EncodePutCommand("put-2", "b", "2")
+	put1, _ := types.EncodePutCommand("put-1", "a", "1", 0)
+	put2, _ := types.EncodePutCommand("put-2", "b", "2", 0)
 	del, _ := types.EncodeDeleteCommand("del-1", "a")
 	txnData, err := types.EncodeTxnCommand(types.TxnCommand{
 		RequestID: "txn-1",
@@ -182,7 +236,7 @@ func TestApplyBatchNotifiesOnlyAfterCommit(t *testing.T) {
 		t.Fatalf("EncodeTxnCommand: %v", err)
 	}
 
-	waiters := map[string]chan error{
+	waiters := map[string]chan types.Result{
 		"put-1": a.RegisterWaiter("put-1"),
 		"put-2": a.RegisterWaiter("put-2"),
 		"del-1": a.RegisterWaiter("del-1"),
@@ -200,9 +254,9 @@ func TestApplyBatchNotifiesOnlyAfterCommit(t *testing.T) {
 
 	for id, ch := range waiters {
 		select {
-		case err := <-ch:
-			if err != nil {
-				t.Fatalf("waiter %s got error %v, want nil", id, err)
+		case res := <-ch:
+			if res.Err != nil {
+				t.Fatalf("waiter %s got error %v, want nil", id, res.Err)
 			}
 		default:
 			t.Fatalf("waiter %s 没有被通知", id)
@@ -224,5 +278,108 @@ func TestApplyBatchNotifiesOnlyAfterCommit(t *testing.T) {
 	}
 	if idx != 4 {
 		t.Fatalf("GetConsistentIndex() = %d, want 4", idx)
+	}
+}
+
+// TestApplyLeaseRevokeOrderedAfterPut 验证同一批 Ready 里
+// [LEASE_GRANT, PUT lease, LEASE_REVOKE] 按日志顺序生效。
+//
+// 租约命令是立即应用的，而 PUT 会先攒进批次。如果不先 flush 批次，
+// Revoke 会在 Put 之前执行：key 写进去时租约已经不存在，绑定落空，
+// key 永远不会被回收。
+func TestApplyLeaseRevokeOrderedAfterPut(t *testing.T) {
+	a := newTestApplier(t)
+
+	grant, err := types.EncodeLeaseCommand(types.LeaseCommand{
+		RequestID: "grant-1", Op: types.OpLeaseGrant, LeaseID: 100, TTL: 60,
+		LeaseStart: time.Now().Unix(),
+	})
+	if err != nil {
+		t.Fatalf("EncodeLeaseCommand(grant): %v", err)
+	}
+	put, err := types.EncodePutCommand("put-1", "k", "v", 100)
+	if err != nil {
+		t.Fatalf("EncodePutCommand: %v", err)
+	}
+	revoke, err := types.EncodeLeaseCommand(types.LeaseCommand{
+		RequestID: "revoke-1", Op: types.OpLeaseRevoke, LeaseID: 100,
+	})
+	if err != nil {
+		t.Fatalf("EncodeLeaseCommand(revoke): %v", err)
+	}
+
+	waiters := map[string]chan types.Result{
+		"grant-1":  a.RegisterWaiter("grant-1"),
+		"put-1":    a.RegisterWaiter("put-1"),
+		"revoke-1": a.RegisterWaiter("revoke-1"),
+	}
+	entries := []raftpb.Entry{
+		{Index: 1, Type: raftpb.EntryNormal, Data: grant},
+		{Index: 2, Type: raftpb.EntryNormal, Data: put},
+		{Index: 3, Type: raftpb.EntryNormal, Data: revoke},
+	}
+	if err := a.Apply(entries); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	for id, ch := range waiters {
+		select {
+		case res := <-ch:
+			if res.Err != nil {
+				t.Fatalf("waiter %s got error %v, want nil", id, res.Err)
+			}
+		default:
+			t.Fatalf("waiter %s 没有被通知", id)
+		}
+	}
+
+	// 租约在 PUT 之后才被撤销，所以 key 必须已被删除
+	if _, ok := a.Get("k"); ok {
+		t.Fatal("租约撤销后 k 应已被删除（Revoke 被提前执行会导致 key 泄漏）")
+	}
+	idx, err := a.GetConsistentIndex()
+	if err != nil {
+		t.Fatalf("GetConsistentIndex: %v", err)
+	}
+	if idx != 3 {
+		t.Fatalf("GetConsistentIndex() = %d, want 3", idx)
+	}
+}
+
+// TestApplyKeepAliveUnknownLeaseDoesNotFail 验证对不存在的租约续租只会把错误
+// 返回给客户端，不会让 Apply 失败——Apply 返回错误会让 Raft 循环 log.Fatalf
+// 退出整个节点，任何客户端都能用一次过期的 keepalive 打挂集群。
+func TestApplyKeepAliveUnknownLeaseDoesNotFail(t *testing.T) {
+	a := newTestApplier(t)
+
+	keepAlive, err := types.EncodeLeaseCommand(types.LeaseCommand{
+		RequestID: "ka-1", Op: types.OpLeaseKeepAlive, LeaseID: 999,
+		LeaseStart: time.Now().Unix(),
+	})
+	if err != nil {
+		t.Fatalf("EncodeLeaseCommand(keepalive): %v", err)
+	}
+	put, err := types.EncodePutCommand("put-1", "k", "v", 0)
+	if err != nil {
+		t.Fatalf("EncodePutCommand: %v", err)
+	}
+
+	kaCh := a.RegisterWaiter("ka-1")
+	entries := []raftpb.Entry{
+		{Index: 1, Type: raftpb.EntryNormal, Data: keepAlive},
+		{Index: 2, Type: raftpb.EntryNormal, Data: put},
+	}
+	if err := a.Apply(entries); err != nil {
+		t.Fatalf("Apply = %v, want nil（租约不存在是客户端错误，不是状态机故障）", err)
+	}
+	select {
+	case res := <-kaCh:
+		if res.Err == nil {
+			t.Fatal("对不存在的租约续租应返回错误")
+		}
+	default:
+		t.Fatal("keepalive 没有通知等待者")
+	}
+	if got, _ := a.Get("k"); got != "v" {
+		t.Fatalf("Get(k) = %q, want v（keepalive 失败不应阻断后续日志）", got)
 	}
 }

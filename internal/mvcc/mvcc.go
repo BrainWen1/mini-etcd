@@ -11,6 +11,7 @@ import (
 	"mini-etcd/internal/backend"
 	"mini-etcd/internal/config"
 	"mini-etcd/internal/types"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,9 @@ import (
 
 // ErrKeyNotFound 表示请求的 key 在状态机中不存在
 var ErrKeyNotFound = errors.New("mvcc: key not found")
+
+// ErrLeaseNotFound 表示租约不存在（已过期/已撤销），或续租的目标已经不存在。
+var ErrLeaseNotFound = errors.New("mvcc: lease not found")
 
 // TombstoneValue 是一个特殊的值，用于标记某个 key 已被删除。
 var TombstoneValue = []byte{0xFF}
@@ -152,7 +156,7 @@ func (m *MVCC) Compact() error {
 // Put 写入数据和 appliedIndex（同一事务）
 func (m *MVCC) Put(key, value string, appliedIndex uint64) error {
 	return m.be.Update(func(tx backend.WriteTx) error {
-		_, err := applyPut(tx, key, value, appliedIndex)
+		_, err := applyPut(tx, key, value, appliedIndex, 0) // 不绑定租约
 		return err
 	})
 }
@@ -160,11 +164,12 @@ func (m *MVCC) Put(key, value string, appliedIndex uint64) error {
 // Entry 是一条已完成解码、待应用到状态机的日志。
 // Op 取值为 "PUT"、"DELETE" 或 "TXN"：PUT/DELETE 使用 Key/Value，TXN 使用 Txn。
 type Entry struct {
-	Index uint64
-	Op    string
-	Key   string
-	Value string
-	Txn   types.TxnCommand // 可选字段：仅当 Op="TXN" 时使用，表示事务命令
+	Index   uint64
+	Op      string
+	Key     string
+	Value   string
+	Txn     types.TxnCommand // 可选字段：仅当 Op="TXN" 时使用，表示事务命令
+	LeaseID int64            // 可选字段：如果是租约相关的事件，记录租约 ID
 }
 
 // ApplyBatch 在同一个 bbolt 事务里按顺序应用一批已提交日志。
@@ -172,22 +177,25 @@ type Entry struct {
 // 每条日志单独开启一次写事务意味着一批日志要付出同样多次 fsync，批量应用把整批
 // 日志的落盘成本压缩成一次。整批要么全部生效、要么全部回滚，因此调用方必须等
 // 本方法成功返回之后才能通知客户端写入成功。
-func (m *MVCC) ApplyBatch(entries []Entry) ([]Event, error) {
+func (m *MVCC) ApplyBatch(entries []Entry) ([]Event, map[uint64]bool, error) {
 	if len(entries) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
-	var allEvents []Event                               // 本批应用成功后要通知的事件
+	var allEvents []Event               // 本批应用成功后要通知的事件
+	txnResults := make(map[uint64]bool) // 记录每条 TXN 日志的执行结果，key 是日志索引，value 是是否走了 Success 分支
+
 	err := m.be.Update(func(tx backend.WriteTx) error { // 在同一个 bbolt 事务里应用整批日志
 		for _, e := range entries {
 			var err error
 			var events []Event
+			var succeeded bool
 			switch e.Op {
 			case "PUT":
-				events, err = applyPut(tx, e.Key, e.Value, e.Index)
+				events, err = applyPut(tx, e.Key, e.Value, e.Index, e.LeaseID)
 			case "DELETE":
-				events, err = applyPut(tx, e.Key, string(TombstoneValue), e.Index)
+				events, err = applyPut(tx, e.Key, string(TombstoneValue), e.Index, e.LeaseID)
 			case "TXN":
-				events, err = applyTxn(tx, e.Txn, e.Index)
+				succeeded, events, err = applyTxn(tx, e.Txn, e.Index)
 			default:
 				err = fmt.Errorf("mvcc: unsupported entry op %q", e.Op)
 			}
@@ -197,13 +205,16 @@ func (m *MVCC) ApplyBatch(entries []Entry) ([]Event, error) {
 
 			// 收集事件，供 Watch 监听器使用
 			allEvents = append(allEvents, events...)
+
+			// 记录 TXN 日志的执行结果，供调用方返回给客户端
+			txnResults[e.Index] = succeeded
 		}
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return allEvents, nil
+	return allEvents, txnResults, nil
 }
 
 // Event 是状态机变更事件，供 Watch 监听器使用。
@@ -212,6 +223,7 @@ type Event struct {
 	Key      string
 	Value    string
 	Revision uint64 // 变更发生时的全局 revision，用于 Watch 监听器判断事件顺序
+	LeaseID  int64  // 可选字段：如果是租约相关的事件，记录租约 ID
 }
 
 func (e Event) JSON() string {
@@ -223,7 +235,7 @@ func (e Event) JSON() string {
 }
 
 // applyPut 在给定事务内写入一条 KV，并推进 consistentIndex
-func applyPut(tx backend.WriteTx, key, value string, appliedIndex uint64) ([]Event, error) {
+func applyPut(tx backend.WriteTx, key, value string, appliedIndex uint64, leaseID int64) ([]Event, error) {
 	// 1. 先做幂等检查：appliedIndex 小于等于当前 consistentIndex，说明这条日志
 	//    之前已经应用过（重启重放、快照回放等），整条日志都必须跳过。
 	//    注意顺序：一定不能先写业务数据再判断，否则重放旧日志会把新值覆盖成旧值。
@@ -239,6 +251,16 @@ func applyPut(tx backend.WriteTx, key, value string, appliedIndex uint64) ([]Eve
 		return nil, nil
 	}
 
+	return applyPutValue(tx, key, value, appliedIndex, leaseID)
+}
+
+// applyPutValue 写入一条 KV、推进 revision/consistentIndex，并维护租约绑定。
+//
+// 调用方必须已经完成幂等检查。单独拆出来是因为一条 LEASE_REVOKE 日志可能在
+// 同一个事务里为多个 key 写墓碑：如果每个 key 都走 applyPut 的幂等检查，
+// 第一个 key 写入后 consistentIndex 就等于本条日志的索引，后续 key 会被误判
+// 为“已应用”而全部跳过。
+func applyPutValue(tx backend.WriteTx, key, value string, appliedIndex uint64, leaseID int64) ([]Event, error) {
 	// 2. 更新全局 revision
 	var currentRev uint64 = 0 // 默认值为 0，表示还没有写入过任何数据
 	currentRevBytes := tx.Get(backend.MetaBucket, []byte(backend.RevisionKey))
@@ -276,9 +298,18 @@ func applyPut(tx backend.WriteTx, key, value string, appliedIndex uint64) ([]Eve
 		return nil, err
 	}
 
-	// 6. 构造事件，供 Watch 监听器使用
+	// 6. 维护 key 与租约的绑定关系。
+	//    PUT 绑定到新租约时，必须先从旧租约的 Key 列表里摘掉自己，否则旧租约
+	//    过期时会把这个已经改绑的 key 一并删除（数据丢失）；
+	//    DELETE 或不带租约的 PUT 都要解除绑定。
+	isDelete := bytes.Equal([]byte(value), TombstoneValue)
+	if err := bindKeyToLease(tx, key, leaseID, isDelete); err != nil {
+		return nil, err
+	}
+
+	// 7. 构造事件，供 Watch 监听器使用
 	eventType := "PUT"
-	if value == string(TombstoneValue) {
+	if isDelete {
 		eventType = "DELETE"
 	}
 	return []Event{
@@ -500,10 +531,18 @@ func (m *MVCC) GetMembers() (map[uint64]config.Member, error) {
 	return members, nil
 }
 
-// 定义快照的数据结构
+// 定义快照的数据结构。
+//
+// Lease/LeaseKey 必须随快照一起复制：租约以及“key -> 租约”的绑定关系也是
+// 状态机的一部分。如果快照里没有它们，落后的 follower 从快照恢复后既不知道
+// 哪些 key 绑定了租约，也没有租约记录，之后应用同一条 LEASE_REVOKE 日志时
+// 无法删除这些 key，与 Leader 的状态机产生永久分歧。
+// 反向索引（lease_key_rev）可以由 LeaseKey 重建，不必进快照。
 type MVCCSnapshot struct {
-	Data map[string][]byte `json:"data"`
-	Meta map[string][]byte `json:"meta"`
+	Data     map[string][]byte `json:"data"`
+	Meta     map[string][]byte `json:"meta"`
+	Lease    map[string][]byte `json:"lease"`     // leaseID -> (ttl、expireTime)
+	LeaseKey map[string][]byte `json:"lease_key"` // leaseID -> keys
 }
 
 // snapshotMagic 标识快照格式为 gob 编码。
@@ -541,6 +580,16 @@ func (m *MVCC) GetSnapshot() ([]byte, error) {
 		snap.Meta, err = tx.GetAllFromBucket(backend.MetaBucket) // 获取全量元数据
 		if err != nil {
 			log.Printf("Failed to get all data from Meta bucket: %v", err)
+			return err
+		}
+		snap.Lease, err = tx.GetAllFromBucket(backend.LeaseBucket) // 获取全量租约
+		if err != nil {
+			log.Printf("Failed to get all data from Lease bucket: %v", err)
+			return err
+		}
+		snap.LeaseKey, err = tx.GetAllFromBucket(backend.LeaseKeyBucket) // 获取租约的 key 绑定
+		if err != nil {
+			log.Printf("Failed to get all data from LeaseKey bucket: %v", err)
 			return err
 		}
 		return nil
@@ -583,6 +632,20 @@ func (m *MVCC) ApplySnapshot(data []byte) error {
 			log.Printf("Failed to clear DataRevision bucket: %v", err)
 			return err
 		}
+		// 租约相关的桶也必须清空：否则本地残留的旧租约/绑定会在快照恢复后
+		// 与新状态机混在一起，各节点对同一条后续日志产生不同结果。
+		if err := tx.ClearBucket(backend.LeaseBucket); err != nil {
+			log.Printf("Failed to clear Lease bucket: %v", err)
+			return err
+		}
+		if err := tx.ClearBucket(backend.LeaseKeyBucket); err != nil {
+			log.Printf("Failed to clear LeaseKey bucket: %v", err)
+			return err
+		}
+		if err := tx.ClearBucket(backend.LeaseKeyRevBucket); err != nil {
+			log.Printf("Failed to clear LeaseKeyRev bucket: %v", err)
+			return err
+		}
 
 		// 2. 恢复 Data 桶
 		for k, v := range snap.Data {
@@ -600,10 +663,29 @@ func (m *MVCC) ApplySnapshot(data []byte) error {
 			}
 		}
 
-		// 4. 根据 Data 桶重建 DataRevision 桶。
+		// 4. 恢复租约与 key 绑定
+		for k, v := range snap.Lease {
+			if err := tx.Put(backend.LeaseBucket, []byte(k), v); err != nil {
+				log.Printf("Failed to restore Lease bucket key %s: %v", k, err)
+				return err
+			}
+		}
+		for k, v := range snap.LeaseKey {
+			if err := tx.Put(backend.LeaseKeyBucket, []byte(k), v); err != nil {
+				log.Printf("Failed to restore LeaseKey bucket key %s: %v", k, err)
+				return err
+			}
+		}
+
+		// 5. 根据 Data 桶重建 DataRevision 桶。
 		//    DataRevision 没有存进快照，如果这里不重建，新节点/重启节点恢复快照后
 		//    Get(key) 会因为查不到最新 revision 而全部返回 ErrKeyNotFound。
-		return rebuildDataRevision(tx)
+		if err := rebuildDataRevision(tx); err != nil {
+			return err
+		}
+
+		// 6. 根据 LeaseKey 重建反向索引（同样没有存进快照）
+		return rebuildLeaseKeyRev(tx)
 	})
 }
 
@@ -632,6 +714,47 @@ func rebuildDataRevision(tx backend.WriteTx) error {
 		binary.BigEndian.PutUint64(revBytes, rev)
 		if err := tx.Put(backend.DataRevisionBucket, []byte(key), revBytes); err != nil {
 			log.Printf("Failed to rebuild DataRevision for key %s: %v", key, err)
+			return err
+		}
+	}
+	return nil
+}
+
+// rebuildLeaseKeyRev 根据 LeaseKeyBucket 重建 “key -> LeaseID” 的反向索引。
+// 快照里只保存 LeaseKey，恢复后必须重建反向索引，否则后续 PUT/DELETE
+// 无法把 key 从旧租约的列表里摘掉，租约到期时会误删已改绑的 key。
+func rebuildLeaseKeyRev(tx backend.WriteTx) error {
+	// 定义一个临时结构体来存储 key 和 leaseID 的绑定关系
+	type binding struct {
+		key     string
+		leaseID int64
+	}
+	var bindings []binding
+
+	c := tx.GetCursor(backend.LeaseKeyBucket)
+	if c != nil {
+		// 遍历 LeaseKeyBucket，收集所有 key -> leaseID 的绑定关系
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			leaseID, err := strconv.ParseInt(string(k), 10, 64)
+			if err != nil {
+				continue
+			}
+			var keys []string
+			if err := json.Unmarshal(v, &keys); err != nil {
+				continue
+			}
+			for _, key := range keys {
+				// 收集绑定关系，后续统一写入 LeaseKeyRevBucket
+				bindings = append(bindings, binding{key: key, leaseID: leaseID})
+			}
+		}
+	}
+
+	// 写入 LeaseKeyRevBucket，建立 key -> leaseID 的反向索引
+	for _, b := range bindings {
+		idBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(idBytes, uint64(b.leaseID))
+		if err := tx.Put(backend.LeaseKeyRevBucket, []byte(b.key), idBytes); err != nil {
 			return err
 		}
 	}
@@ -712,13 +835,13 @@ func (m *MVCC) Range(prefix string, limit int) ([]KVPair, error) {
 // 条件判断和分支内的写入必须原子完成：否则并发读可能看到"条件已满足"却还没写入的中间状态。
 func (m *MVCC) Txn(txnCmd types.TxnCommand, appliedIndex uint64) error {
 	return m.be.Update(func(tx backend.WriteTx) error {
-		_, err := applyTxn(tx, txnCmd, appliedIndex)
+		_, _, err := applyTxn(tx, txnCmd, appliedIndex)
 		return err
 	})
 }
 
 // applyTxn 在给定事务内执行一条事务日志
-func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) ([]Event, error) {
+func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) (bool, []Event, error) {
 	// 1. 幂等检查（与 Put 相同）：重放旧日志时整条事务都必须跳过
 	var currentIdx uint64 = 0
 	currentIdxBytes := tx.Get(backend.MetaBucket, []byte(backend.ConsistentIndexKey))
@@ -726,7 +849,7 @@ func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) 
 		currentIdx = binary.BigEndian.Uint64(currentIdxBytes)
 	}
 	if appliedIndex <= currentIdx {
-		return nil, nil // 重复应用，直接跳过
+		return false, nil, nil // 重复应用，直接跳过
 	}
 
 	// 2. 评估所有 If 条件（多个条件之间是 AND）。
@@ -736,7 +859,7 @@ func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) 
 		actualVal, _ := getTxValue(tx, cmp.Key)
 		matched, err := cmp.Match(actualVal)
 		if err != nil {
-			return nil, fmt.Errorf("txn compare %q: %w", cmp.Key, err)
+			return false, nil, fmt.Errorf("txn compare %q: %w", cmp.Key, err)
 		}
 		if !matched {
 			allMatched = false
@@ -768,7 +891,7 @@ func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) 
 			valToWrite = TombstoneValue
 		default:
 			// 正常路径下 Server 已经校验过；这里兜底，避免把非法操作当成空值写入。
-			return nil, fmt.Errorf("txn: unsupported operation %q", op.Op)
+			return false, nil, fmt.Errorf("txn: unsupported operation %q", op.Op)
 		}
 
 		currentRev++ // 事务内的每个写操作，Revision 都加 1
@@ -776,14 +899,19 @@ func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) 
 		// 写入 DataBucket
 		keyWithRev := backend.GetKeyWithRevision(op.Key, currentRev)
 		if err := tx.Put(backend.DataBucket, keyWithRev, valToWrite); err != nil {
-			return nil, err
+			return false, nil, err
 		}
 
 		// 更新 DataRevisionBucket
 		opRevBytes := make([]byte, 8)
 		binary.BigEndian.PutUint64(opRevBytes, currentRev)
 		if err := tx.Put(backend.DataRevisionBucket, []byte(op.Key), opRevBytes); err != nil {
-			return nil, err
+			return false, nil, err
+		}
+
+		// 维护 key 与租约的绑定关系（DELETE 会解除绑定）
+		if err := bindKeyToLease(tx, op.Key, op.LeaseID, op.Op == "DELETE"); err != nil {
+			return false, nil, err
 		}
 
 		// 构造事件，供 Watch 监听器使用
@@ -798,13 +926,14 @@ func applyTxn(tx backend.WriteTx, txnCmd types.TxnCommand, appliedIndex uint64) 
 
 	// 5. 更新全局 Revision 和 AppliedIndex（同一事务，保证原子落盘）
 	if err := putMetaUint64(tx, backend.RevisionKey, currentRev); err != nil {
-		return nil, err
+		return false, nil, err
 	}
 	if err := putMetaUint64(tx, backend.ConsistentIndexKey, appliedIndex); err != nil {
-		return nil, err
+		return false, nil, err
 	}
-
-	return events, nil
+	// allMatched 表示 If 条件是否全部满足，供调用方判断执行了哪个分支
+	// 比如用于分布式锁利用事务的原子性抢锁后，调用方可以根据 allMatched 判断自己是否抢到锁
+	return allMatched, events, nil
 }
 
 // getTxValue 在同一个 bbolt 事务内读取 key 的最新值。
@@ -886,4 +1015,257 @@ func (m *MVCC) GetHistory(key string, isPrefix bool, startRev uint64) ([]Event, 
 	})
 
 	return events, nil
+}
+
+// ---------------------------------------------------------------------------
+// 租约（Lease）
+// ---------------------------------------------------------------------------
+
+// leaseIDKey 把 LeaseID 转成 LaunchBucket/LeaseKeyBucket 中的 key。
+func leaseIDKey(leaseID int64) []byte {
+	return []byte(strconv.FormatInt(leaseID, 10))
+}
+
+// encodeLease 把 TTL 和过期时间序列化成 16 字节：前 8 字节 TTL，后 8 字节 ExpireTime。
+func encodeLease(ttl, expireTime int64) []byte {
+	val := make([]byte, 16)
+	binary.BigEndian.PutUint64(val[:8], uint64(ttl))
+	binary.BigEndian.PutUint64(val[8:], uint64(expireTime))
+	return val
+}
+
+// decodeLease 解析 encodeLease 的输出；长度不对说明数据损坏。
+func decodeLease(val []byte) (ttl, expireTime int64, ok bool) {
+	if len(val) != 16 {
+		return 0, 0, false
+	}
+	return int64(binary.BigEndian.Uint64(val[:8])), int64(binary.BigEndian.Uint64(val[8:])), true
+}
+
+// readLeaseKeys 读取租约绑定的 key 列表。
+func readLeaseKeys(tx backend.WriteTx, leaseID int64) []string {
+	keysBytes := tx.Get(backend.LeaseKeyBucket, leaseIDKey(leaseID))
+	if keysBytes == nil {
+		return nil
+	}
+	var keys []string
+	if err := json.Unmarshal(keysBytes, &keys); err != nil {
+		log.Printf("[mvcc] 解析租约 %d 的 key 列表失败: %v", leaseID, err)
+		return nil
+	}
+	return keys
+}
+
+// writeLeaseKeys 写回租约的 key 列表；列表为空时删除整条记录，避免留下空数组。
+func writeLeaseKeys(tx backend.WriteTx, leaseID int64, keys []string) error {
+	if len(keys) == 0 {
+		return tx.DeleteKeyInBucket(backend.LeaseKeyBucket, leaseIDKey(leaseID))
+	}
+	data, err := json.Marshal(keys)
+	if err != nil {
+		return err
+	}
+	return tx.Put(backend.LeaseKeyBucket, leaseIDKey(leaseID), data)
+}
+
+// leaseIDForKey 通过反向索引查出 key 当前绑定的租约，没有绑定返回 0。
+func leaseIDForKey(tx backend.WriteTx, key string) int64 {
+	val := tx.Get(backend.LeaseKeyRevBucket, []byte(key))
+	if len(val) != 8 {
+		return 0
+	}
+	return int64(binary.BigEndian.Uint64(val))
+}
+
+// bindKeyToLease 维护 key 与租约的绑定关系。
+//
+// leaseID <= 0 或 isDelete=true 表示解除绑定。改绑时必须先从旧租约的列表里
+// 摘掉这个 key，否则旧租约到期时会删掉一个已经属于新租约的 key。
+// 目标租约不存在时只写数据、不建立绑定：这样 key 不会绑定到一个永远不会被
+// 回收的租约上（正常路径下 Server 已经在提议前校验过租约存在）。
+func bindKeyToLease(tx backend.WriteTx, key string, leaseID int64, isDelete bool) error {
+	if isDelete {
+		leaseID = 0
+	}
+	// 如果 key 当前绑定的租约就是目标租约，说明绑定关系没有变化，直接返回。
+	oldID := leaseIDForKey(tx, key)
+	if oldID == leaseID {
+		return nil
+	}
+
+	// 1. 从旧租约的 key 列表里移除
+	if oldID > 0 {
+		// 读取旧租约的 key 列表
+		oldKeys := readLeaseKeys(tx, oldID)
+		kept := oldKeys[:0]
+		for _, k := range oldKeys {
+			// 如果当前 key 不是目标 key，则保留
+			// 也就是移除目标 key
+			if k != key {
+				kept = append(kept, k)
+			}
+		}
+		// 将移除了目标 key 的新列表写回旧租约的记录
+		if err := writeLeaseKeys(tx, oldID, kept); err != nil {
+			return err
+		}
+	}
+
+	// 2. 解除绑定：删除反向索引即可
+	if leaseID <= 0 {
+		return tx.DeleteKeyInBucket(backend.LeaseKeyRevBucket, []byte(key))
+	}
+
+	// 3. 目标租约不存在：不建立绑定
+	if tx.Get(backend.LeaseBucket, leaseIDKey(leaseID)) == nil {
+		return tx.DeleteKeyInBucket(backend.LeaseKeyRevBucket, []byte(key))
+	}
+
+	// 4. 加入新租约的 key 列表
+	keys := readLeaseKeys(tx, leaseID)
+	if !slices.Contains(keys, key) {
+		keys = append(keys, key)
+		if err := writeLeaseKeys(tx, leaseID, keys); err != nil {
+			return err
+		}
+	}
+
+	// 5. 写入反向索引
+	idBytes := make([]byte, 8)
+	binary.BigEndian.PutUint64(idBytes, uint64(leaseID))
+	return tx.Put(backend.LeaseKeyRevBucket, []byte(key), idBytes)
+}
+
+// appliedAlready 判断 appliedIndex 是否已经应用过（重启重放、快照回放等）。
+func appliedAlready(tx backend.WriteTx, appliedIndex uint64) bool {
+	var current uint64
+	if b := tx.Get(backend.MetaBucket, []byte(backend.ConsistentIndexKey)); len(b) == 8 {
+		current = binary.BigEndian.Uint64(b)
+	}
+	return appliedIndex <= current
+}
+
+// GrantLease 授予租约，写入租约 ID、TTL 和过期时间。
+//
+// 过期时间 = 日志里的 leaseStart + TTL，不使用本节点的 time.Now()：
+// 状态机必须只由日志内容决定，否则落后节点重放同一条 Grant 时会用更晚的
+// 本地时钟重新计算，得到一个比 Leader 更晚的过期时间，节点之间产生分歧。
+func (m *MVCC) GrantLease(leaseID, ttl, leaseStart int64, appliedIndex uint64) error {
+	return m.be.Update(func(tx backend.WriteTx) error {
+		if appliedAlready(tx, appliedIndex) {
+			log.Printf("[mvcc] LeaseGrant: appliedIndex %d already applied, skipping duplicate entry\n", appliedIndex)
+			return nil
+		}
+
+		expireTime := leaseStart + ttl
+		if err := tx.Put(backend.LeaseBucket, leaseIDKey(leaseID), encodeLease(ttl, expireTime)); err != nil {
+			return err
+		}
+		return putMetaUint64(tx, backend.ConsistentIndexKey, appliedIndex)
+	})
+}
+
+// RevokeLease 撤销租约，删除租约记录，并为该租约绑定的所有 Key 写入 TombstoneValue。
+// 返回值是需要推给 Watch 的 DELETE 事件。
+func (m *MVCC) RevokeLease(leaseID int64, appliedIndex uint64) ([]Event, error) {
+	var events []Event
+	err := m.be.Update(func(tx backend.WriteTx) error {
+		// 幂等检查：重放旧日志时不能再删一次 key（否则会把后来写入的新值覆盖成墓碑），
+		// 也不能把 consistentIndex 回退到本条日志的索引。
+		if appliedAlready(tx, appliedIndex) {
+			log.Printf("[mvcc] LeaseRevoke: appliedIndex %d already applied, skipping duplicate entry\n", appliedIndex)
+			return nil
+		}
+
+		// 1. 取出该租约绑定的 key（副本；写入过程中会同步修改 LeaseKeyBucket）
+		keys := readLeaseKeys(tx, leaseID)
+
+		// 2. 为每个 key 写墓碑。
+		//    这里必须调用 applyPutValue：applyPut 的幂等检查基于 consistentIndex，
+		//    第一个 key 写完后 consistentIndex 就等于本条日志索引，后续 key 会被
+		//    误判为“已应用”而全部跳过，导致只删掉第一个 key。
+		for _, key := range keys {
+			ev, err := applyPutValue(tx, key, string(TombstoneValue), appliedIndex, leaseID)
+			if err != nil {
+				return err
+			}
+			events = append(events, ev...)
+		}
+
+		// 3. 删除租约记录和 key 列表（反向索引已由 applyPutValue 里调用的解绑流程清理）
+		if err := tx.DeleteKeyInBucket(backend.LeaseBucket, leaseIDKey(leaseID)); err != nil {
+			return err
+		}
+		if err := tx.DeleteKeyInBucket(backend.LeaseKeyBucket, leaseIDKey(leaseID)); err != nil {
+			return err
+		}
+
+		// 4. 更新 consistentIndex
+		return putMetaUint64(tx, backend.ConsistentIndexKey, appliedIndex)
+	})
+	return events, err
+}
+
+// KeepAliveLease 续租，用日志里的 leaseStart 重新计算过期时间。
+//
+// TTL 在 Grant 时写入状态机，之后不再变化，所以续租只需要 Leader 打的时间戳：
+// 过期时间同样是 leaseStart + TTL，所有节点重放同一条日志会得到相同结果。
+// 租约不存在时返回 ErrLeaseNotFound：这是正常的客户端错误（租约已过期/撤销），
+// 调用方应只把它返回给客户端，而不是当成状态机故障。
+func (m *MVCC) KeepAliveLease(leaseID, leaseStart int64, appliedIndex uint64) error {
+	return m.be.Update(func(tx backend.WriteTx) error {
+		if appliedAlready(tx, appliedIndex) {
+			return nil
+		}
+
+		ttl, _, ok := decodeLease(tx.Get(backend.LeaseBucket, leaseIDKey(leaseID)))
+		if !ok {
+			return ErrLeaseNotFound
+		}
+
+		expireTime := leaseStart + ttl
+		if err := tx.Put(backend.LeaseBucket, leaseIDKey(leaseID), encodeLease(ttl, expireTime)); err != nil {
+			return err
+		}
+		return putMetaUint64(tx, backend.ConsistentIndexKey, appliedIndex)
+	})
+}
+
+// LeaseExists 判断租约是否仍然存在。
+func (m *MVCC) LeaseExists(leaseID int64) (bool, error) {
+	var exists bool
+	err := m.be.View(func(tx backend.ReadTx) error {
+		exists = tx.Get(backend.LeaseBucket, leaseIDKey(leaseID)) != nil
+		return nil
+	})
+	return exists, err
+}
+
+// GetExpiredLeases 获取所有已过期的租约 ID
+func (m *MVCC) GetExpiredLeases() ([]int64, error) {
+	var expiredLeases []int64
+	now := time.Now().Unix() // 在 View 事务外获取当前时间，避免事务内的时间漂移导致误判
+
+	err := m.be.View(func(tx backend.ReadTx) error {
+		c := tx.GetCursor(backend.LeaseBucket)
+		if c == nil {
+			return nil
+		}
+
+		for k, v := c.First(); k != nil; k, v = c.Next() {
+			_, expireTime, ok := decodeLease(v)
+			if !ok {
+				continue // 数据损坏，跳过
+			}
+			if expireTime <= now {
+				leaseID, err := strconv.ParseInt(string(k), 10, 64)
+				if err != nil {
+					continue // 数据损坏，跳过
+				}
+				expiredLeases = append(expiredLeases, leaseID)
+			}
+		}
+		return nil
+	})
+	return expiredLeases, err
 }

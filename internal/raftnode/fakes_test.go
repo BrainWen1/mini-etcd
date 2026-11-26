@@ -57,3 +57,6 @@ func (nopApplier) RemoveMember(uint64) error { return nil }
 func (nopApplier) GetMembers() (map[uint64]config.Member, error) {
 	return map[uint64]config.Member{}, nil
 }
+
+// GetExpiredLeases 假装状态机里没有过期的 LeaseID。
+func (nopApplier) GetExpiredLeases() ([]int64, error) { return nil, nil }
