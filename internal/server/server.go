@@ -8,6 +8,7 @@ import (
 	"maps"
 	"mini-etcd/internal/apply"
 	"mini-etcd/internal/config"
+	"mini-etcd/internal/metrics"
 	"mini-etcd/internal/mvcc"
 	"mini-etcd/internal/raftnode"
 	"mini-etcd/internal/storage"
@@ -215,14 +216,17 @@ func (s *Server) validateLeases(leaseIDs []int64) error {
 func (s *Server) HandlePut(key, value string, leaseID int64) types.Result {
 	if leaseID > 0 {
 		if err := s.validateLeases([]int64{leaseID}); err != nil {
+			metrics.APIRequestsTotal.WithLabelValues("PUT", "400").Inc() // 统计无效租约的请求
 			return types.Result{Succeeded: false, Err: err}
 		}
 	}
 	reqID := s.nextRequestID()
 	cmd, err := types.EncodePutCommand(reqID, key, value, leaseID)
 	if err != nil {
+		metrics.APIRequestsTotal.WithLabelValues("PUT", "500").Inc() // 统计编码失败的请求
 		return types.Result{Succeeded: false, Err: fmt.Errorf("encode command failed: %w", err)}
 	}
+	metrics.APIRequestsTotal.WithLabelValues("PUT", "200").Inc() // 统计成功提交的请求
 	return s.proposeAndWait(reqID, cmd)
 }
 
@@ -246,8 +250,10 @@ func (s *Server) readBarrier() error {
 // HandleGet 处理客户端的 GET 请求，读取最新数据
 func (s *Server) HandleGet(key string) (string, error) {
 	if err := s.readBarrier(); err != nil {
+		metrics.APIRequestsTotal.WithLabelValues("GET", "500").Inc() // 统计读取失败的请求
 		return "", err
 	}
+	metrics.APIRequestsTotal.WithLabelValues("GET", "200").Inc() // 统计成功读取的请求
 	return s.mvcc.Get(key)
 }
 
@@ -256,8 +262,10 @@ func (s *Server) HandleGetAtRevision(key string, rev uint64) (string, error) {
 	// 历史版本读同样要追平：落后节点上可能还没应用 rev 之后的日志，
 	// 直接读本地 MVCC 会返回 rev 之前就已经过期的值。
 	if err := s.readBarrier(); err != nil {
+		metrics.APIRequestsTotal.WithLabelValues("GET", "500").Inc() // 统计读取失败的请求
 		return "", err
 	}
+	metrics.APIRequestsTotal.WithLabelValues("GET", "200").Inc() // 统计成功读取的请求
 	return s.mvcc.GetAtRevision(key, rev)
 }
 
@@ -266,8 +274,10 @@ func (s *Server) HandleDelete(key string) types.Result {
 	reqID := s.nextRequestID()
 	cmd, err := types.EncodeDeleteCommand(reqID, key)
 	if err != nil {
+		metrics.APIRequestsTotal.WithLabelValues("DELETE", "500").Inc() // 统计编码失败的请求
 		return types.Result{Succeeded: false, Err: fmt.Errorf("encode command failed: %w", err)}
 	}
+	metrics.APIRequestsTotal.WithLabelValues("DELETE", "200").Inc() // 统计成功提交的请求
 	return s.proposeAndWait(reqID, cmd)
 }
 
@@ -282,6 +292,7 @@ func (s *Server) HandleTxn(compares []types.Compare, success, failure []types.Op
 	}
 	// 写进 Raft 日志前先校验：非法命令一旦进入日志，每次重放都会失败
 	if err := types.ValidateTxnCommand(txnCmd); err != nil {
+		metrics.APIRequestsTotal.WithLabelValues("TXN", "400").Inc() // 统计无效事务的请求
 		return types.Result{Succeeded: false, Err: fmt.Errorf("invalid txn: %w", err)}
 	}
 	// 同样在提议前确认事务引用的租约都存在
@@ -294,12 +305,15 @@ func (s *Server) HandleTxn(compares []types.Compare, success, failure []types.Op
 		}
 	}
 	if err := s.validateLeases(leaseIDs); err != nil {
+		metrics.APIRequestsTotal.WithLabelValues("TXN", "400").Inc() // 统计无效租约的事务请求
 		return types.Result{Succeeded: false, Err: err}
 	}
 	cmd, err := types.EncodeTxnCommand(txnCmd)
 	if err != nil {
+		metrics.APIRequestsTotal.WithLabelValues("TXN", "500").Inc() // 统计编码失败的事务请求
 		return types.Result{Succeeded: false, Err: fmt.Errorf("encode command failed: %w", err)}
 	}
+	metrics.APIRequestsTotal.WithLabelValues("TXN", "200").Inc() // 统计成功提交的事务请求
 	return s.proposeAndWait(txnCmd.RequestID, cmd)
 }
 
@@ -307,8 +321,10 @@ func (s *Server) HandleTxn(compares []types.Compare, success, failure []types.Op
 func (s *Server) HandleRange(prefix string, limit int) ([]mvcc.KVPair, error) {
 	// 与 GET 一样，前缀查询也必须先追平 ReadIndex，避免 Follower 返回旧结果
 	if err := s.readBarrier(); err != nil {
+		metrics.APIRequestsTotal.WithLabelValues("RANGE", "500").Inc() // 统计读取失败的请求
 		return nil, err
 	}
+	metrics.APIRequestsTotal.WithLabelValues("RANGE", "200").Inc() // 统计成功读取的请求
 	return s.mvcc.Range(prefix, limit)
 }
 
@@ -346,12 +362,15 @@ func (s *Server) Member(id uint64) (config.Member, bool) {
 // 只记 Raft 地址会导致新节点当选 Leader 后整个集群的写请求无法转发。
 func (s *Server) HandleAddMember(id uint64, raftAddr, grpcAddr string) error {
 	if id == 0 {
+		metrics.APIRequestsTotal.WithLabelValues("ADD_MEMBER", "400").Inc() // 统计无效成员的请求
 		return errors.New("member id must be non-zero")
 	}
 	if raftAddr == "" {
+		metrics.APIRequestsTotal.WithLabelValues("ADD_MEMBER", "400").Inc() // 统计无效成员的请求
 		return errors.New("raft address must not be empty")
 	}
 	if grpcAddr == "" {
+		metrics.APIRequestsTotal.WithLabelValues("ADD_MEMBER", "400").Inc() // 统计无效成员的请求
 		return errors.New("grpc address must not be empty")
 	}
 
@@ -363,8 +382,10 @@ func (s *Server) HandleAddMember(id uint64, raftAddr, grpcAddr string) error {
 		// 地址不同则拒绝：Raft 的 AddNode 对已存在节点是空操作，
 		// 但本地 Transport 会被改成新地址，导致各节点成员表不一致。
 		if existing.RaftAddr == raftAddr && existing.GRPCAddr == grpcAddr {
+			metrics.APIRequestsTotal.WithLabelValues("ADD_MEMBER", "200").Inc() // 统计重复成员的请求
 			return nil
 		}
+		metrics.APIRequestsTotal.WithLabelValues("ADD_MEMBER", "400").Inc() // 统计重复成员的请求
 		return fmt.Errorf("%w: member %d as raft=%s grpc=%s; remove it first",
 			ErrMemberExists, id, existing.RaftAddr, existing.GRPCAddr)
 	}
@@ -379,14 +400,17 @@ func (s *Server) HandleAddMember(id uint64, raftAddr, grpcAddr string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.Rn.ProposeConfChangeAndWait(ctx, cc); err != nil {
+		metrics.APIRequestsTotal.WithLabelValues("ADD_MEMBER", "500").Inc() // 统计添加成员失败的请求
 		return fmt.Errorf("propose conf change failed: %w", err)
 	}
+	metrics.APIRequestsTotal.WithLabelValues("ADD_MEMBER", "200").Inc() // 统计添加成员成功的请求
 	return nil
 }
 
 // HandleRemoveMember 处理客户端的 RemoveMember 请求：提交配置变更并等待本地应用完成。
 func (s *Server) HandleRemoveMember(id uint64) error {
 	if id == 0 {
+		metrics.APIRequestsTotal.WithLabelValues("REMOVE_MEMBER", "400").Inc() // 统计无效成员的请求
 		return errors.New("member id must be non-zero")
 	}
 
@@ -395,10 +419,12 @@ func (s *Server) HandleRemoveMember(id uint64) error {
 	remaining := len(s.members)
 	s.membersMu.RUnlock()
 	if !exists {
+		metrics.APIRequestsTotal.WithLabelValues("REMOVE_MEMBER", "400").Inc() // 统计不存在成员的请求
 		return fmt.Errorf("%w: member %d", ErrMemberNotFound, id)
 	}
 	// 移除最后一个成员会让集群永久失去法定人数，直接拒绝。
 	if remaining <= 1 {
+		metrics.APIRequestsTotal.WithLabelValues("REMOVE_MEMBER", "400").Inc() // 统计移除最后成员的请求
 		return ErrLastMember
 	}
 
@@ -410,8 +436,10 @@ func (s *Server) HandleRemoveMember(id uint64) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.Rn.ProposeConfChangeAndWait(ctx, cc); err != nil {
+		metrics.APIRequestsTotal.WithLabelValues("REMOVE_MEMBER", "500").Inc() // 统计移除成员失败的请求
 		return fmt.Errorf("propose conf change failed: %w", err)
 	}
+	metrics.APIRequestsTotal.WithLabelValues("REMOVE_MEMBER", "200").Inc() // 统计移除成员成功的请求
 	return nil
 }
 
@@ -433,6 +461,7 @@ func (s *Server) Watch(key string, isPrefix bool) chan mvcc.Event {
 		s.exactWatchChannels[key] = append(s.exactWatchChannels[key], ch)
 	}
 
+	metrics.APIRequestsTotal.WithLabelValues("WATCH", "200").Inc() // 统计注册监听器的请求
 	// 返回 channel，用于接受事件通知和注销监听器
 	return ch
 }
@@ -510,6 +539,7 @@ func (s *Server) HandleLeaseGrant(ttl int64) (int64, types.Result) {
 	reqID := s.nextRequestID()
 	leaseID := s.snowflakeNode.Generate().Int64() // 使用雪花算法生成唯一的 LeaseID
 	if leaseID <= 0 {
+		metrics.APIRequestsTotal.WithLabelValues("LEASE_GRANT", "500").Inc() // 统计生成租约失败的请求
 		return 0, types.Result{Succeeded: false, Err: errors.New("failed to generate lease id")}
 	}
 	cmd, err := types.EncodeLeaseCommand(types.LeaseCommand{
@@ -522,8 +552,10 @@ func (s *Server) HandleLeaseGrant(ttl int64) (int64, types.Result) {
 		LeaseStart: time.Now().Unix(),
 	})
 	if err != nil {
+		metrics.APIRequestsTotal.WithLabelValues("LEASE_GRANT", "500").Inc() // 统计编码失败的请求
 		return 0, types.Result{Succeeded: false, Err: fmt.Errorf("encode command failed: %w", err)}
 	}
+	metrics.APIRequestsTotal.WithLabelValues("LEASE_GRANT", "200").Inc() // 统计成功提交的请求
 	return leaseID, s.proposeAndWait(reqID, cmd)
 }
 
@@ -537,8 +569,10 @@ func (s *Server) HandleLeaseRevoke(leaseID int64) types.Result {
 	})
 
 	if err != nil {
+		metrics.APIRequestsTotal.WithLabelValues("LEASE_REVOKE", "500").Inc() // 统计编码失败的请求
 		return types.Result{Succeeded: false, Err: fmt.Errorf("encode command failed: %w", err)}
 	}
+	metrics.APIRequestsTotal.WithLabelValues("LEASE_REVOKE", "200").Inc() // 统计成功提交的请求
 	return s.proposeAndWait(reqID, cmd)
 }
 
@@ -560,7 +594,9 @@ func (s *Server) HandleLeaseKeepAlive(leaseID int64) types.Result {
 		LeaseStart: time.Now().Unix(),
 	})
 	if err != nil {
+		metrics.APIRequestsTotal.WithLabelValues("LEASE_KEEP_ALIVE", "500").Inc() // 统计编码失败的请求
 		return types.Result{Succeeded: false, Err: fmt.Errorf("encode command failed: %w", err)}
 	}
+	metrics.APIRequestsTotal.WithLabelValues("LEASE_KEEP_ALIVE", "200").Inc() // 统计成功提交的请求
 	return s.proposeAndWait(reqID, cmd)
 }
