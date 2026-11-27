@@ -13,12 +13,15 @@ import (
 	"mini-etcd/internal/storage"
 	"mini-etcd/internal/transport"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -183,6 +186,17 @@ func main() {
 			log.Fatalf("gRPC server failed: %v", err)
 		}
 	}(cfg.GRPCPort)
+
+	// 启动一个独立的 HTTP 端口来暴露 Prometheus metrics
+	go func() {
+		// 为每个节点分配不同的 metrics 端口，例如 2112 + nodeID
+		metricsAddr := fmt.Sprintf(":%d", 2112+id)
+		log.Printf("Prometheus metrics server listening on %s", metricsAddr)
+		http.Handle("/metrics", promhttp.Handler())
+		if err := http.ListenAndServe(metricsAddr, nil); err != nil {
+			log.Printf("Metrics server error: %v", err)
+		}
+	}()
 
 	// 优雅退出：收到信号，或者本节点已被移出集群（配置变更日志被应用）
 	sigCh := make(chan os.Signal, 1)

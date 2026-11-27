@@ -1,0 +1,41 @@
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: minietcd-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # 允许 Prometheus 容器访问宿主机的服务
+    networks:
+      - minietcd-monitoring
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: minietcd-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin # 请改为强密码
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - minietcd-monitoring
+
+volumes:
+  prom-data:
+  grafana-data:
+
+networks:
+  minietcd-monitoring:
+    driver: bridge

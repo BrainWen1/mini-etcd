@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log"
 	"mini-etcd/internal/config"
+	"mini-etcd/internal/metrics"
 	"time"
 
 	"go.etcd.io/etcd/raft/v3"
@@ -295,7 +296,14 @@ func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { /
 			}
 			rn.readIndexMu.Unlock()
 
-			// 6. 推进
+			// 6. 更新 Prometheus 指标
+			status := rn.Node.Status()
+			metrics.RaftState.Set(float64(status.RaftState))
+			metrics.RaftTerm.Set(float64(status.Term))
+			metrics.RaftCommitIndex.Set(float64(status.Commit))
+			metrics.RaftAppliedIndex.Set(float64(status.Applied)) // 注意：这里的 Applied 是 Raft 内部的 appliedIndex，而不是状态机的 consistentIndex
+
+			// 7. 推进
 			rn.Node.Advance()
 		}
 	}

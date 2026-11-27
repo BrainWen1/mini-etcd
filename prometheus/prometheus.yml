@@ -1,0 +1,10 @@
+# prometheus/prometheus.yml
+global:
+  scrape_interval: 15s # 全局抓取间隔
+  evaluation_interval: 15s # 全局评估间隔
+
+scrape_configs:
+  - job_name: 'minietcd'
+    static_configs:
+      # metrics 端口为 2112 + nodeID
+      - targets: ['host.docker.internal:2113', 'host.docker.internal:2114', 'host.docker.internal:2115', 'host.docker.internal:2116']
