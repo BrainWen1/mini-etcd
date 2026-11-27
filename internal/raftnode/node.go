@@ -48,7 +48,7 @@ type Applier interface {
 
 	// 成员表随状态机快照一起复制：ConfState 只有 ID，地址必须由状态机保存，
 	// 否则落后节点通过快照追赶时无法恢复新成员的地址。
-	UpsertMember(id uint64, raftAddr, httpAddr string) (config.Member, error)
+	UpsertMember(id uint64, raftAddr, grpcAddr string) (config.Member, error)
 	RemoveMember(id uint64) error
 	GetMembers() (map[uint64]config.Member, error)
 
@@ -57,8 +57,8 @@ type Applier interface {
 
 // MembershipChangeHandler 在一条配置变更日志被本地应用后回调。
 // added=true 表示新增/更新成员，added=false 表示移除成员。
-// Server 用它同步 Leader 代理所需的 HTTPPeers，并持久化成员表 members（同时包含 Raft 和 HTTP 地址）。
-type MembershipChangeHandler func(id uint64, raftAddr, httpAddr string, added bool)
+// Server 用它同步 Leader 转发所需的 GRPCPeers，并持久化成员表 members（同时包含 Raft 和 gRPC 地址）。
+type MembershipChangeHandler func(id uint64, raftAddr, grpcAddr string, added bool)
 
 // RaftNode 封装了 etcd/raft 的 Node，并添加了存储和传输的引用
 type RaftNode struct {
@@ -93,7 +93,7 @@ type RaftNode struct {
 	removedOnce       sync.Once               // 保证 removed 只关闭一次
 
 	// members 是本地已知的成员表（含两种地址），与状态机里的成员表保持一致。
-	// 应用快照后用它做 diff，把 Transport 和 Leader 代理表更新到快照对应的成员配置。
+	// 应用快照后用它做 diff，把 Transport 和 Leader 转发表更新到快照对应的成员配置。
 	membersMu sync.RWMutex
 	members   map[uint64]config.Member
 }
@@ -102,7 +102,7 @@ type RaftNode struct {
 const readIndexKeyLen = 16
 
 // readIndexTimeout 是一个 ReadIndex 批次从发起到收到 ReadState 的总预算。
-// 与 HTTP 层单次请求的超时保持一致：底层已经放弃的读，上层也没必要再等。
+// 与 gRPC 层单次请求的超时保持一致：底层已经放弃的读，上层也没必要再等。
 const readIndexTimeout = 5 * time.Second
 
 // readIndexAttemptTimeout 是单次 ReadIndex 尝试等待 ReadState 的时间。
@@ -162,11 +162,11 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 
 	rpeers := make([]raft.Peer, 0, len(peersIDs))
 	for _, id := range peersIDs {
-		// Context 里同时带上 Raft 与 HTTP 地址：Bootstrap 产生的初始 ConfChange
+		// Context 里同时带上 Raft 与 gRPC 地址：Bootstrap 产生的初始 ConfChange
 		// 条目会被 Run 循环当作普通配置变更应用，所有节点都能据此填好成员表。
 		rpeers = append(rpeers, raft.Peer{
 			ID:      id,
-			Context: config.EncodeMemberContext(cfg.Peers[id], cfg.HTTPPeers[id]),
+			Context: config.EncodeMemberContext(cfg.Peers[id], cfg.GRPCPeers[id]),
 		})
 	}
 
@@ -235,7 +235,7 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 		// PreVote 对动态缩容很关键：被移除的节点可能还没收到“自己被移除”的日志
 		// （Leader 在应用配置变更后就不再给它发消息了），它会继续发起选举。
 		// 没有 PreVote 时，每次选举都会把集群的 term 抬高一任，逼现有 Leader 下台，
-		// 期间写请求会返回 503；
+		// 期间写请求会返回 Unavailable；
 		// 开启后，其他节点会拒绝它的预投票，集群 term 不会被打断，已移除节点也无法靠更大的 term 干扰集群。
 		PreVote: true,
 	}
@@ -297,7 +297,7 @@ func NewRaftNode(cfg config.Config, storage Storage, trans Transport, applier Ap
 	// 独立的 Member 记录；之后每次应用 ConfChange / 快照都会覆盖它。
 	members := make(map[uint64]config.Member, len(cfg.Peers))
 	for id, raftAddr := range cfg.Peers {
-		members[id] = config.Member{ID: id, RaftAddr: raftAddr, HTTPAddr: cfg.HTTPPeers[id]}
+		members[id] = config.Member{ID: id, RaftAddr: raftAddr, GRPCAddr: cfg.GRPCPeers[id]}
 	}
 
 	return &RaftNode{
@@ -350,15 +350,15 @@ func (rn *RaftNode) markRemoved() {
 //
 // 处理顺序很重要：
 //  1. 先写状态机 —— 成员表必须随快照一起复制，否则落后节点通过快照追赶时
-//     只能拿到 ConfState 里的节点 ID，拿不到 Raft/HTTP 地址；
+//     只能拿到 ConfState 里的节点 ID，拿不到 Raft/gRPC 地址；
 //  2. 再改内存里的 members 表；
-//  3. 最后同步 Transport 与 Server 的 Leader 代理表和持久化成员表。
+//  3. 最后同步 Transport 与 Server 的 Leader 转发表和持久化成员表。
 func (rn *RaftNode) applyMembershipChange(cc *raftpb.ConfChange, member config.Member) {
 	switch cc.Type {
 	case raftpb.ConfChangeAddNode, raftpb.ConfChangeUpdateNode:
 		// 写状态机：UpsertMember 会返回实际写入的成员（可能是更新了地址），
 		// 以便更新内存里的 members 表和 Transport。
-		effective, err := rn.applier.UpsertMember(cc.NodeID, member.RaftAddr, member.HTTPAddr)
+		effective, err := rn.applier.UpsertMember(cc.NodeID, member.RaftAddr, member.GRPCAddr)
 		if err != nil {
 			// 状态机写失败意味着成员表无法进入后续快照，重启/新节点追赶时
 			// 一定会再次出现“找不到新成员地址”的问题，继续运行只会扩大不一致。
@@ -374,14 +374,14 @@ func (rn *RaftNode) applyMembershipChange(cc *raftpb.ConfChange, member config.M
 		if effective.RaftAddr == "" {
 			log.Printf("[Node %d] Warning: 成员 %d 没有 Raft 地址，Transport 无法向它发送消息", rn.nodeID, cc.NodeID)
 		} else {
-			// 更新 Transport 的代理表：如果是更新地址，AddPeer 会覆盖旧地址
+			// 更新 Transport 的 peer 表：如果是更新地址，AddPeer 会覆盖旧地址
 			rn.trans.AddPeer(cc.NodeID, effective.RaftAddr)
 		}
-		log.Printf(">>> 集群成员新增/更新: Node %d, RaftAddr: %s, HTTPAddr: %s",
-			cc.NodeID, effective.RaftAddr, effective.HTTPAddr)
+		log.Printf(">>> 集群成员新增/更新: Node %d, RaftAddr: %s, GRPCAddr: %s",
+			cc.NodeID, effective.RaftAddr, effective.GRPCAddr)
 		if h := rn.getMembershipChangeHandler(); h != nil {
-			// 通知 Server 更新 Leader 代理表和持久化成员表 members（同时包含 Raft 和 HTTP 地址）
-			h(cc.NodeID, effective.RaftAddr, effective.HTTPAddr, true)
+			// 通知 Server 更新 Leader 转发表和持久化成员表 members（同时包含 Raft 和 gRPC 地址）
+			h(cc.NodeID, effective.RaftAddr, effective.GRPCAddr, true)
 		}
 
 	case raftpb.ConfChangeRemoveNode:
@@ -411,20 +411,20 @@ func (rn *RaftNode) applyMembershipChange(cc *raftpb.ConfChange, member config.M
 	}
 }
 
-// syncMembershipFromSnapshot 在本地应用一份 Raft 快照后，把快照里的 ConfState 同步到内存里的成员表，并更新 Transport 与 Server 的代理表
+// syncMembershipFromSnapshot 在本地应用一份 Raft 快照后，把快照里的 ConfState 同步到内存里的成员表，并更新 Transport 与 Server 的转发表
 //
 // 这是“节点离线期间集群又发生变化”场景的关键修复。
 // 例如节点 4 掉线期间节点 5 加入集群，之后节点 4 恢复：
 //   - Leader 里关于节点 5 的 ConfChange 日志可能已经被压缩；
 //   - 节点 4 只能收到快照，而快照的 ConfState 只有节点 ID，没有地址；
 //   - 没有本方法时，节点 4 既不会给节点 5 发 Raft 消息（GET 的 ReadIndex 需要
-//     发给 Leader），Leader 代理表里也没有节点 5 的 HTTP 地址（写请求 503）。
+//     发给 Leader），Leader 转发表里也没有节点 5 的 gRPC 地址（写请求会被拒绝（Unavailable））。
 //
 // 成员地址随状态机快照一起复制，所以 ApplySnapshot 之后从状态机读出来的
 // 成员表就是快照那一刻的完整成员配置。
 func (rn *RaftNode) syncMembershipFromSnapshot(confState raftpb.ConfState) {
 	// 从状态机里读取成员表，和快照里的 ConfState 对比，更新内存里的 members 表。
-	// 同时包含 Raft 和 HTTP 地址
+	// 同时包含 Raft 和 gRPC 地址
 	stored, err := rn.applier.GetMembers()
 	if err != nil {
 		rn.storage.Close()
@@ -466,22 +466,22 @@ func (rn *RaftNode) syncMembershipFromSnapshot(confState raftpb.ConfState) {
 	rn.members = next
 	rn.membersMu.Unlock()
 
-	// 新增或地址发生变化的成员：更新 Transport 与 Server 的代理表。
+	// 新增或地址发生变化的成员：更新 Transport 与 Server 的转发表。
 	for id, m := range next {
 		if m.RaftAddr != "" {
 			rn.trans.AddPeer(id, m.RaftAddr)
 		}
 		old, existed := prev[id]
-		if !existed || old.RaftAddr != m.RaftAddr || old.HTTPAddr != m.HTTPAddr {
-			// 成员地址发生变化，需要更新代理表
-			log.Printf("[Node %d] 从快照同步成员: Node %d, RaftAddr: %s, HTTPAddr: %s",
-				rn.nodeID, id, m.RaftAddr, m.HTTPAddr)
+		if !existed || old.RaftAddr != m.RaftAddr || old.GRPCAddr != m.GRPCAddr {
+			// 成员地址发生变化，需要更新转发表
+			log.Printf("[Node %d] 从快照同步成员: Node %d, RaftAddr: %s, GRPCAddr: %s",
+				rn.nodeID, id, m.RaftAddr, m.GRPCAddr)
 			if h := rn.getMembershipChangeHandler(); h != nil {
-				h(id, m.RaftAddr, m.HTTPAddr, true)
+				h(id, m.RaftAddr, m.GRPCAddr, true)
 			}
 		}
 	}
-	// 快照里已经不存在的成员：断开连接并从代理表删除。
+	// 快照里已经不存在的成员：断开连接并从转发表删除。
 	for id := range prev {
 		if _, ok := next[id]; !ok {
 			rn.trans.RemovePeer(id)
@@ -509,7 +509,7 @@ func confChangeKey(cc *raftpb.ConfChange) string {
 // ProposeConfChangeAndWait 提交配置变更，并阻塞到该变更在本地被应用。
 //
 // 只调用 Node.ProposeConfChange 只能保证“已入队”，不能保证“已提交”。
-// 如果 HTTP 层此时就返回 200，Leader 可能在变更丢失/超时后仍然告诉客户端成功。
+// 如果 gRPC 层此时就返回成功，Leader 可能在变更丢失/超时后仍然告诉客户端成功。
 func (rn *RaftNode) ProposeConfChangeAndWait(ctx context.Context, cc *raftpb.ConfChange) error {
 	key := confChangeKey(cc) // cc.Type + cc.NodeID 唯一标识一次配置变更提议
 	ch := make(chan error, 1)

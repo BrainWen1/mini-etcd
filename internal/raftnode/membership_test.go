@@ -50,12 +50,12 @@ func TestProposeConfChangeAndWait(t *testing.T) {
 	type event struct {
 		id       uint64
 		raftAddr string
-		httpAddr string
+		grpcAddr string
 		added    bool
 	}
 	events := make(chan event, 16)
-	rn.SetMembershipChangeHandler(func(id uint64, raftAddr, httpAddr string, added bool) {
-		events <- event{id: id, raftAddr: raftAddr, httpAddr: httpAddr, added: added}
+	rn.SetMembershipChangeHandler(func(id uint64, raftAddr, grpcAddr string, added bool) {
+		events <- event{id: id, raftAddr: raftAddr, grpcAddr: grpcAddr, added: added}
 	})
 
 	stop := make(chan struct{})
@@ -88,7 +88,7 @@ func TestProposeConfChangeAndWait(t *testing.T) {
 			if ev.id != 4 {
 				continue // Bootstrap 产生的初始成员事件
 			}
-			if !ev.added || ev.raftAddr != "127.0.0.1:8004" || ev.httpAddr != "127.0.0.1:10004" {
+			if !ev.added || ev.raftAddr != "127.0.0.1:8004" || ev.grpcAddr != "127.0.0.1:10004" {
 				t.Fatalf("unexpected membership event: %+v", ev)
 			}
 			return
@@ -130,22 +130,22 @@ func (a *staticApplier) GetMembers() (map[uint64]config.Member, error) {
 // 场景：节点 4 掉线，期间节点 5 加入；节点 4 恢复后只收到一份快照。
 // 快照的 ConfState 只有 ID（1,2,3,4,5），地址必须从状态机里恢复；
 // 否则节点 4 不知道 Leader 5 的 Raft 地址（GET 的 ReadIndex 发不出去），
-// 代理表里也没有 5 的 HTTP 地址（写请求 503）。
+// 代理表里也没有 5 的 gRPC 地址（写请求 503）。
 func TestSyncMembershipFromSnapshot(t *testing.T) {
 	trans := newRecordingTransport()
 	applier := &staticApplier{members: map[uint64]config.Member{
-		1: {ID: 1, RaftAddr: "127.0.0.1:8001", HTTPAddr: "127.0.0.1:10001"},
-		2: {ID: 2, RaftAddr: "127.0.0.1:8002", HTTPAddr: "127.0.0.1:10002"},
-		3: {ID: 3, RaftAddr: "127.0.0.1:8003", HTTPAddr: "127.0.0.1:10003"},
-		4: {ID: 4, RaftAddr: "127.0.0.1:8004", HTTPAddr: "127.0.0.1:10004"},
+		1: {ID: 1, RaftAddr: "127.0.0.1:8001", GRPCAddr: "127.0.0.1:10001"},
+		2: {ID: 2, RaftAddr: "127.0.0.1:8002", GRPCAddr: "127.0.0.1:10002"},
+		3: {ID: 3, RaftAddr: "127.0.0.1:8003", GRPCAddr: "127.0.0.1:10003"},
+		4: {ID: 4, RaftAddr: "127.0.0.1:8004", GRPCAddr: "127.0.0.1:10004"},
 		// 节点 5 的地址只存在于快照携带的状态机成员表里。
-		5: {ID: 5, RaftAddr: "127.0.0.1:8005", HTTPAddr: "127.0.0.1:10005"},
+		5: {ID: 5, RaftAddr: "127.0.0.1:8005", GRPCAddr: "127.0.0.1:10005"},
 	}}
 
 	type event struct {
 		id       uint64
 		raftAddr string
-		httpAddr string
+		grpcAddr string
 		added    bool
 	}
 	events := make(chan event, 16)
@@ -156,12 +156,12 @@ func TestSyncMembershipFromSnapshot(t *testing.T) {
 		applier: applier,
 		// 恢复前节点 4 的本地成员表：只有 1..4，且 6 是离线期间被移除的陈旧成员。
 		members: map[uint64]config.Member{
-			1: {ID: 1, RaftAddr: "127.0.0.1:8001", HTTPAddr: "127.0.0.1:10001"},
-			6: {ID: 6, RaftAddr: "127.0.0.1:8006", HTTPAddr: "127.0.0.1:10006"},
+			1: {ID: 1, RaftAddr: "127.0.0.1:8001", GRPCAddr: "127.0.0.1:10001"},
+			6: {ID: 6, RaftAddr: "127.0.0.1:8006", GRPCAddr: "127.0.0.1:10006"},
 		},
 	}
-	rn.SetMembershipChangeHandler(func(id uint64, raftAddr, httpAddr string, added bool) {
-		events <- event{id: id, raftAddr: raftAddr, httpAddr: httpAddr, added: added}
+	rn.SetMembershipChangeHandler(func(id uint64, raftAddr, grpcAddr string, added bool) {
+		events <- event{id: id, raftAddr: raftAddr, grpcAddr: grpcAddr, added: added}
 	})
 
 	rn.syncMembershipFromSnapshot(raftpb.ConfState{Voters: []uint64{1, 2, 3, 4, 5}})
@@ -181,7 +181,7 @@ func TestSyncMembershipFromSnapshot(t *testing.T) {
 		switch {
 		case ev.id == 5 && ev.added:
 			sawAdd5 = true
-			if ev.raftAddr != "127.0.0.1:8005" || ev.httpAddr != "127.0.0.1:10005" {
+			if ev.raftAddr != "127.0.0.1:8005" || ev.grpcAddr != "127.0.0.1:10005" {
 				t.Fatalf("node 5 event = %+v, want both addresses", ev)
 			}
 		case ev.id == 6 && !ev.added:
@@ -279,9 +279,9 @@ func TestConfChangesReplayAfterRestart(t *testing.T) {
 	rn2 := NewRaftNode(cfg, w2, nopTransport{}, applier)
 
 	added := make(chan config.Member, 4)
-	rn2.SetMembershipChangeHandler(func(id uint64, raftAddr, httpAddr string, isAdd bool) {
+	rn2.SetMembershipChangeHandler(func(id uint64, raftAddr, grpcAddr string, isAdd bool) {
 		if isAdd && id == 4 {
-			added <- config.Member{ID: id, RaftAddr: raftAddr, HTTPAddr: httpAddr}
+			added <- config.Member{ID: id, RaftAddr: raftAddr, GRPCAddr: grpcAddr}
 		}
 	})
 
@@ -295,7 +295,7 @@ func TestConfChangesReplayAfterRestart(t *testing.T) {
 
 	select {
 	case member := <-added:
-		if member.RaftAddr != "127.0.0.1:8004" || member.HTTPAddr != "127.0.0.1:10004" {
+		if member.RaftAddr != "127.0.0.1:8004" || member.GRPCAddr != "127.0.0.1:10004" {
 			t.Fatalf("replayed member = %+v, want both addresses", member)
 		}
 	case <-time.After(3 * time.Second):

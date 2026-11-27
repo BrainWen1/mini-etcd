@@ -458,11 +458,11 @@ func (m *MVCC) GetConsistentIndex() (uint64, error) {
 // ConfChange.Context 里，也就是只存在于“某一条日志”里。一旦这条日志被快照
 // 压缩掉，落后太多的节点通过快照追赶时就只能拿到 ID，拿不到地址：
 //   - Transport 没有新成员的 Raft 地址，发不出 MsgApp/MsgReadIndex；
-//   - Leader 代理表没有新成员的 HTTP 地址，写请求 503。
+//   - Leader 转发表没有新成员的 gRPC 地址，写请求会被拒绝（Unavailable）。
 //
 // 把成员表写进 bbolt 的 MetaBucket 后，它会随 MVCC 快照一起被复制和恢复，
 // 于是“快照 = 数据 + 成员表”成为一份自洽的状态，新节点恢复快照后能立即
-// 补齐 Transport 和代理地址表。成员表不参与 consistentIndex 的幂等判断，
+// 补齐 Transport 和转发表。成员表不参与 consistentIndex 的幂等判断，
 // 因此不需要和业务日志共用事务，也不会把索引推快。
 const MembershipMetaPrefix = "member/"
 
@@ -473,14 +473,14 @@ func memberMetaKey(id uint64) []byte {
 
 // UpsertMember 写入/更新一个成员的两种地址，返回写入的记录。
 //
-// ConfChange.Context 永远同时携带 Raft 与 HTTP 地址，所以这里直接以本次
-// 变更的地址为准，不做“空字段保留旧值”的合并。返回最终记录是为了让调用方
-// （Raft 循环）用同一份地址去更新 Transport 与 Leader 代理表。
-func (m *MVCC) UpsertMember(id uint64, raftAddr, httpAddr string) (config.Member, error) {
+// ConfChange.Context 永远同时携带 Raft 与客户端 API（gRPC）地址，所以这里
+// 直接以本次变更的地址为准，不做“空字段保留旧值”的合并。返回最终记录是为了
+// 让调用方（Raft 循环）用同一份地址去更新 Transport 与 Leader 转发表。
+func (m *MVCC) UpsertMember(id uint64, raftAddr, grpcAddr string) (config.Member, error) {
 	var result config.Member
 	err := m.be.Update(func(tx backend.WriteTx) error {
 		key := memberMetaKey(id)
-		result = config.Member{ID: id, RaftAddr: raftAddr, HTTPAddr: httpAddr}
+		result = config.Member{ID: id, RaftAddr: raftAddr, GRPCAddr: grpcAddr}
 		data, err := json.Marshal(result)
 		if err != nil {
 			return fmt.Errorf("encode member %d: %w", id, err)
@@ -501,7 +501,7 @@ func (m *MVCC) RemoveMember(id uint64) error {
 // GetMembers 读取状态机中的全量成员表。
 //
 // 快照恢复后（ApplySnapshot）成员表随 MetaBucket 一起被替换，
-// Raft 循环会用本方法的结果重建 Transport 的 peer 地址表和 Leader 代理表。
+// Raft 循环会用本方法的结果重建 Transport 的 peer 地址表和 Leader 转发表。
 func (m *MVCC) GetMembers() (map[uint64]config.Member, error) {
 	members := make(map[uint64]config.Member)
 	err := m.be.View(func(tx backend.ReadTx) error {
@@ -1229,6 +1229,30 @@ func (m *MVCC) KeepAliveLease(leaseID, leaseStart int64, appliedIndex uint64) er
 		}
 		return putMetaUint64(tx, backend.ConsistentIndexKey, appliedIndex)
 	})
+}
+
+// LeaseTTL 返回租约剩余的存活时间（秒），租约不存在时返回 ErrLeaseNotFound。
+// 用于 KeepAlive 响应：客户端据此决定下一次续租的时间。
+// 过期时间由日志里的 leaseStart + TTL 计算，这里不做任何修正；
+// 已经过期的租约返回 0，由后台 GC 负责真正清理。
+func (m *MVCC) LeaseTTL(leaseID int64) (int64, error) {
+	var ttl int64
+	now := time.Now().Unix()
+	err := m.be.View(func(tx backend.ReadTx) error {
+		_, expireTime, ok := decodeLease(tx.Get(backend.LeaseBucket, leaseIDKey(leaseID)))
+		if !ok {
+			return ErrLeaseNotFound
+		}
+		ttl = expireTime - now
+		if ttl < 0 {
+			ttl = 0
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return ttl, nil
 }
 
 // LeaseExists 判断租约是否仍然存在。

@@ -1,3 +1,9 @@
+// Package httpapi 是旧版 HTTP+JSON 接口的参考实现。
+//
+// Deprecated: 对外接口已经由 internal/grpcapi 提供，main 不再启动本服务。
+// 保留这份代码只为对照 gRPC 版的校验、错误处理和 Watch 行为。
+// 注意：成员表里的客户端地址现在指向 gRPC 端口，因此本包里的
+// "反向代理到 Leader" 路径已经不能实际工作，不要在生产环境启用。
 package httpapi
 
 import (
@@ -323,7 +329,7 @@ func (h *HTTPServer) proxyToLeader(w http.ResponseWriter, r *http.Request) bool 
 		return false // 自己是 Leader，不需要代理，放行
 	}
 
-	leaderAddr := h.srv.GetLeaderHTTPAddr()
+	leaderAddr := h.srv.GetLeaderGRPCAddr()
 	if leaderAddr == "" {
 		// 没有选出 Leader，返回 503 Service Unavailable
 		http.Error(w, "no leader elected yet", http.StatusServiceUnavailable)
@@ -358,7 +364,7 @@ func (h *HTTPServer) proxyToLeader(w http.ResponseWriter, r *http.Request) bool 
 type AddMemberRequest struct {
 	ID       uint64 `json:"id"`
 	RaftAddr string `json:"raft_addr"`
-	HTTPAddr string `json:"http_addr"`
+	GRPCAddr string `json:"grpc_addr"`
 }
 
 // handleAddMember 处理 POST /v1/cluster/members/add，添加新成员到集群
@@ -383,13 +389,13 @@ func (h *HTTPServer) handleAddMember(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "raft_addr must not be empty")
 		return
 	}
-	if req.HTTPAddr == "" {
-		writeError(w, http.StatusBadRequest, "http_addr must not be empty")
+	if req.GRPCAddr == "" {
+		writeError(w, http.StatusBadRequest, "grpc_addr must not be empty")
 		return
 	}
 
 	// 调用 server 的 HandleAddMember 方法处理添加成员请求
-	if err := h.srv.HandleAddMember(req.ID, req.RaftAddr, req.HTTPAddr); err != nil {
+	if err := h.srv.HandleAddMember(req.ID, req.RaftAddr, req.GRPCAddr); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

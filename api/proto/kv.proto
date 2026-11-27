@@ -1,0 +1,161 @@
+// kv.proto 定义 mini-etcd 面向客户端的全部服务：
+// KV 读写、Watch 订阅、Lease 租约与 Cluster 成员管理。
+//
+// 写请求（Put/Delete/Txn/Lease*/Cluster*）必须由 Leader 处理；
+// Get/Range 借助 ReadIndex 在任意节点本地完成；
+// Watch 直接读取本地已应用的状态机。
+syntax = "proto3";
+
+package minietcd.v1;
+
+option go_package = "mini-etcd/api/proto;etcdpb";
+
+import "etcd.proto";
+
+// ============================================================
+// KV：基础读写与事务
+// ============================================================
+
+message PutRequest {
+  string key = 1;
+  string value = 2;
+  // 可选：绑定的租约 ID，0 表示不绑定。租约过期后该 key 会被自动删除。
+  int64 lease_id = 3;
+}
+// 保留专用响应消息（而不是 google.protobuf.Empty），便于后续追加字段。
+message PutResponse {}
+
+message GetRequest {
+  string key = 1;
+  // 0 表示读取最新值；非 0 表示读取 revision <= 该值的最新版本。
+  uint64 revision = 2;
+}
+message GetResponse {
+  KeyValue kv = 1;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+message DeleteResponse {}
+
+message RangeRequest {
+  string prefix = 1;
+  // <= 0 表示不限制返回条数。
+  int64 limit = 2;
+}
+message RangeResponse {
+  repeated KeyValue kvs = 1;
+}
+
+message Compare {
+  string key = 1;
+  CompareOp op = 2;
+  string value = 3;
+}
+
+message Operation {
+  OperationType op = 1;
+  string key = 2;
+  // DELETE 时忽略 value。
+  string value = 3;
+  // PUT 时可选的租约绑定，0 表示不绑定。
+  int64 lease_id = 4;
+}
+
+// TxnRequest 描述一个事务：compares 之间是 AND 关系，
+// 全部成立执行 success 分支，否则执行 failure 分支。
+message TxnRequest {
+  repeated Compare compares = 1;
+  repeated Operation success = 2;
+  repeated Operation failure = 3;
+}
+message TxnResponse {
+  // 是否走了 success 分支。分布式锁场景必须检查该字段，
+  // 不能只看 RPC 是否返回成功。
+  bool succeeded = 1;
+}
+
+service KV {
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+  rpc Range(RangeRequest) returns (RangeResponse);
+  rpc Txn(TxnRequest) returns (TxnResponse);
+}
+
+// ============================================================
+// Watch：服务端流式推送
+// ============================================================
+
+message WatchRequest {
+  string key = 1;
+  // true 表示按前缀匹配，false 表示精确匹配。
+  bool prefix = 2;
+  // 只补发 revision > start_revision 的历史事件；0 表示不补发。
+  uint64 start_revision = 3;
+}
+
+service Watch {
+  // 一次订阅，服务端持续推送，直到客户端取消或连接断开。
+  rpc Watch(WatchRequest) returns (stream Event);
+}
+
+// ============================================================
+// Lease：租约
+// ============================================================
+
+message LeaseGrantRequest {
+  // 租约有效期（秒），必须为正数。
+  int64 ttl = 1;
+}
+message LeaseGrantResponse {
+  int64 lease_id = 1;
+}
+
+message LeaseRevokeRequest {
+  int64 lease_id = 1;
+}
+message LeaseRevokeResponse {}
+
+message LeaseKeepAliveRequest {
+  int64 lease_id = 1;
+}
+message LeaseKeepAliveResponse {
+  int64 lease_id = 1;
+  // 续租后的剩余 TTL（秒）。租约已过期/不存在时为 0 且 succeeded=false。
+  int64 ttl = 2;
+  bool succeeded = 3;
+}
+
+service Lease {
+  rpc LeaseGrant(LeaseGrantRequest) returns (LeaseGrantResponse);
+  rpc LeaseRevoke(LeaseRevokeRequest) returns (LeaseRevokeResponse);
+  // 双向流：客户端按自己的节奏发送续租请求，服务端逐条 ACK。
+  // 单条租约不存在不会终止整条流，客户端可以为多个租约复用同一个连接。
+  rpc LeaseKeepAlive(stream LeaseKeepAliveRequest) returns (stream LeaseKeepAliveResponse);
+}
+
+// ============================================================
+// Cluster：动态成员管理
+// ============================================================
+
+message MemberAddRequest {
+  uint64 id = 1;
+  // 新节点的 Raft 通信地址。
+  string raft_addr = 2;
+  // 新节点的客户端（gRPC）地址：新节点当选 Leader 后，
+  // 其它节点据此转发写请求。
+  string grpc_addr = 3;
+}
+message MemberAddResponse {}
+
+message MemberRemoveRequest {
+  uint64 id = 1;
+}
+message MemberRemoveResponse {}
+
+service Cluster {
+  rpc MemberAdd(MemberAddRequest) returns (MemberAddResponse);
+  rpc MemberRemove(MemberRemoveRequest) returns (MemberRemoveResponse);
+}

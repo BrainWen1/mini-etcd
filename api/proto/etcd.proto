@@ -1,0 +1,56 @@
+// etcd.proto 定义 mini-etcd 所有服务共享的通用类型与枚举常量。
+//
+// 这里只放跨服务复用的东西：具体的 RPC 定义按领域放在对应文件里（如 kv.proto）。
+// 新增字段时只能追加 tag，不能修改或复用已有 tag，否则老客户端会解析错位。
+syntax = "proto3";
+
+// proto 包名带版本号，避免将来出现不兼容变更时直接破坏老客户端。
+// 生成后 Go 侧统一使用 etcdpb 一个包，因此两个 proto 文件共享同一份类型空间。
+package minietcd.v1;
+
+option go_package = "mini-etcd/api/proto;etcdpb";
+
+// KeyValue 是 Get / Range 返回的键值对。
+message KeyValue {
+  string key = 1;
+  string value = 2;
+}
+
+// Event 是一次 KV 变更，由 Watch 流式推送给客户端。
+message Event {
+  EventType type = 1;
+  string key = 2;
+  // DELETE 事件的 value 为空。
+  string value = 3;
+  // revision 是本次变更的全局版本号，单调递增；
+  // 客户端断线重连时把它作为 start_revision 即可续传。
+  uint64 revision = 4;
+  // lease 是写入时绑定的租约 ID，0 表示未绑定。
+  int64 lease = 5;
+}
+
+// CompareOp 是事务比较条件支持的运算符。
+enum CompareOp {
+  // 未指定时按 EQUAL 处理，兼容旧 JSON 接口省略 op 字段的行为。
+  COMPARE_OP_UNSPECIFIED = 0;
+  COMPARE_OP_EQUAL = 1;
+  COMPARE_OP_NOT_EQUAL = 2;
+  COMPARE_OP_GREATER = 3;
+  COMPARE_OP_GREATER_OR_EQUAL = 4;
+  COMPARE_OP_LESS = 5;
+  COMPARE_OP_LESS_OR_EQUAL = 6;
+}
+
+// OperationType 是事务分支中写操作的类型。
+enum OperationType {
+  OPERATION_TYPE_UNSPECIFIED = 0;
+  OPERATION_TYPE_PUT = 1;
+  OPERATION_TYPE_DELETE = 2;
+}
+
+// EventType 是 Watch 事件的类型。
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_PUT = 1;
+  EVENT_TYPE_DELETE = 2;
+}

@@ -77,8 +77,8 @@ func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { /
 				// 快照里只有节点 ID（ConfState），成员地址在状态机的成员表里。
 				// 必须在 ApplySnapshot 之后立刻同步：落后节点可能错过了新成员的
 				// ConfChange 日志（已被 Leader 压缩），只能靠这一步补齐 Transport
-				// 的 peer 地址和 Leader 代理表。否则它对 Leader 的 ReadIndex
-				// 发不出去、写请求也代理不到新节点。
+				// 的 peer 地址和 Leader 转发表。否则它对 Leader 的 ReadIndex
+				// 发不出去、写请求也转发不到新节点。
 				rn.syncMembershipFromSnapshot(rd.Snapshot.Metadata.ConfState)
 
 				// 更新 RaftNode 的 lastSnapshotIndex 和 confState 字段
@@ -138,10 +138,10 @@ func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { /
 						}
 
 						// c. 应用到状态机、网络层与本地状态。
-						// Context 里同时编码了 Raft 地址和 HTTP 地址：
+						// Context 里同时编码了 Raft 地址和 gRPC 地址：
 						//   - Raft 地址给 Transport 建连；
-						//   - HTTP 地址给 Leader 代理，缺少它时新节点当选 Leader 后
-						//     其他节点会把写请求代理到空地址。
+						//   - gRPC 地址给 Leader 转发，缺少它时新节点当选 Leader 后
+						//     其他节点会把写请求转发到空地址。
 						member := config.DecodeMemberContext(cc.Context)
 						rn.applyMembershipChange(&cc, member)
 						membershipChanged = true

@@ -46,8 +46,8 @@ func (nopApplier) GetConsistentIndex() (uint64, error) { return 0, nil }
 func (nopApplier) AdvanceConsistentIndex(uint64) error { return nil }
 
 // UpsertMember 假装保存成员，直接回显调用方传入的地址。
-func (nopApplier) UpsertMember(id uint64, raftAddr, httpAddr string) (config.Member, error) {
-	return config.Member{ID: id, RaftAddr: raftAddr, HTTPAddr: httpAddr}, nil
+func (nopApplier) UpsertMember(id uint64, raftAddr, grpcAddr string) (config.Member, error) {
+	return config.Member{ID: id, RaftAddr: raftAddr, GRPCAddr: grpcAddr}, nil
 }
 
 // RemoveMember 假装删除成员，实际什么都不做。

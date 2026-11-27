@@ -247,9 +247,9 @@ func (a *Applier) AdvanceConsistentIndex(index uint64) error {
 
 // UpsertMember 把成员地址写入状态机。
 // 成员表放在状态机里是为了随快照一起复制：ConfState 只有节点 ID，
-// 落后节点只靠快照追赶时无法从快照元数据里恢复 Raft/HTTP 地址。
-func (a *Applier) UpsertMember(id uint64, raftAddr, httpAddr string) (config.Member, error) {
-	return a.mvccStorage.UpsertMember(id, raftAddr, httpAddr)
+// 落后节点只靠快照追赶时无法从快照元数据里恢复 Raft/gRPC 地址。
+func (a *Applier) UpsertMember(id uint64, raftAddr, grpcAddr string) (config.Member, error) {
+	return a.mvccStorage.UpsertMember(id, raftAddr, grpcAddr)
 }
 
 // RemoveMember 从状态机中删除成员。

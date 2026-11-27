@@ -62,7 +62,7 @@ func TestPutSkipsStaleEntry(t *testing.T) {
 //
 // 这是动态扩容的关键不变量：ConfState 只有节点 ID，成员地址只能从状态机里恢复。
 // 如果成员表不进入快照，离线期间错过 ConfChange 日志的节点在通过快照追赶后，
-// 就永远不知道新成员的 Raft/HTTP 地址。
+// 就永远不知道新成员的 Raft/gRPC 地址。
 func TestMembershipSurvivesSnapshot(t *testing.T) {
 	src := newTestMVCC(t)
 	if _, err := src.UpsertMember(4, "127.0.0.1:8004", "127.0.0.1:10004"); err != nil {
@@ -89,7 +89,7 @@ func TestMembershipSurvivesSnapshot(t *testing.T) {
 	if len(members) != 2 {
 		t.Fatalf("members = %+v, want 2 members", members)
 	}
-	if m := members[4]; m.RaftAddr != "127.0.0.1:8004" || m.HTTPAddr != "127.0.0.1:10004" {
+	if m := members[4]; m.RaftAddr != "127.0.0.1:8004" || m.GRPCAddr != "127.0.0.1:10004" {
 		t.Fatalf("member 4 = %+v, want both addresses restored", m)
 	}
 

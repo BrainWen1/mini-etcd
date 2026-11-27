@@ -7,7 +7,7 @@ import (
 	"mini-etcd/internal/apply"
 	"mini-etcd/internal/backend"
 	"mini-etcd/internal/config"
-	"mini-etcd/internal/httpapi"
+	"mini-etcd/internal/grpcapi"
 	"mini-etcd/internal/mvcc"
 	"mini-etcd/internal/server"
 	"mini-etcd/internal/storage"
@@ -30,18 +30,19 @@ func main() {
 	// example:
 	// $go run ./cmd/mini-etcd -id 4 -join \
 	// -raft-addr "127.0.0.1:8004" \
-	// -http-addr "127.0.0.1:10004" \
+	// -grpc-addr "127.0.0.1:10004" \
 	// -peers "1=127.0.0.1:8001,2=127.0.0.1:8002,3=127.0.0.1:8003,4=127.0.0.1:8004" \
-	// -http-peers "1=127.0.0.1:10001,2=127.0.0.1:10002,3=127.0.0.1:10003,4=127.0.0.1:10004"
-	// $curl -X POST http://127.0.0.1:10001/v1/cluster/members/add \
-	//   -d '{"id":4, "raft_addr":"127.0.0.1:8004", "http_addr":"127.0.0.1:10004"}'
+	// -grpc-peers "1=127.0.0.1:10001,2=127.0.0.1:10002,3=127.0.0.1:10003,4=127.0.0.1:10004"
+	// $grpcurl -plaintext \
+	//   -d '{"id":4,"raft_addr":"127.0.0.1:8004","grpc_addr":"127.0.0.1:10004"}' \
+	//   127.0.0.1:10001 minietcd.v1.Cluster/MemberAdd
 	raftAddrFlag := flag.String("raft-addr", "", "Raft listen address of this node, e.g. 127.0.0.1:8004")
-	httpAddrFlag := flag.String("http-addr", "", "HTTP API address of this node, e.g. 127.0.0.1:10004")
+	grpcAddrFlag := flag.String("grpc-addr", "", "gRPC API address of this node, e.g. 127.0.0.1:10004")
 	peersFlag := flag.String("peers", "", "Known cluster members' raft addresses: 1=127.0.0.1:8001,2=127.0.0.1:8002")
-	httpPeersFlag := flag.String("http-peers", "", "Known cluster members' HTTP addresses: 1=127.0.0.1:10001,2=127.0.0.1:10002")
+	grpcPeersFlag := flag.String("grpc-peers", "", "Known cluster members' gRPC addresses: 1=127.0.0.1:10001,2=127.0.0.1:10002")
 	flag.Parse()
 
-	log.Printf("启动 mini-etcd 节点，参数: id=%d, join=%v, raft-addr=%s, http-addr=%s, peers=%s, http-peers=%s", *idFlag, *joinFlag, *raftAddrFlag, *httpAddrFlag, *peersFlag, *httpPeersFlag)
+	log.Printf("启动 mini-etcd 节点，参数: id=%d, join=%v, raft-addr=%s, grpc-addr=%s, peers=%s, grpc-peers=%s", *idFlag, *joinFlag, *raftAddrFlag, *grpcAddrFlag, *peersFlag, *grpcPeersFlag)
 
 	id := *idFlag
 	if id == 0 {
@@ -49,14 +50,14 @@ func main() {
 	}
 	join := *joinFlag
 
-	// 默认拓扑：本地三节点集群。动态扩容时应通过 -peers/-http-peers
+	// 默认拓扑：本地三节点集群。动态扩容时应通过 -peers/-grpc-peers
 	// 传入完整拓扑，或者使用默认地址并仅指定新节点自己的地址。
 	peersAddrMap := map[uint64]string{ // 用于 Raft 节点之间的通信，需要知道完整的 ip 和 port
 		1: "127.0.0.1:8001",
 		2: "127.0.0.1:8002",
 		3: "127.0.0.1:8003",
 	}
-	httpAddrMap := map[uint64]string{ // 用于启动 HTTP 服务，提供客户端访问接口，只需要知道端口号即可
+	grpcAddrMap := map[uint64]string{ // 用于启动 gRPC 服务，提供客户端访问接口
 		1: "127.0.0.1:10001",
 		2: "127.0.0.1:10002",
 		3: "127.0.0.1:10003",
@@ -69,23 +70,23 @@ func main() {
 			log.Fatalf("invalid -peers: %v", err)
 		}
 	}
-	if *httpPeersFlag != "" {
-		httpAddrMap, err = parsePeerMap(*httpPeersFlag)
+	if *grpcPeersFlag != "" {
+		grpcAddrMap, err = parsePeerMap(*grpcPeersFlag)
 		if err != nil {
-			log.Fatalf("invalid -http-peers: %v", err)
+			log.Fatalf("invalid -grpc-peers: %v", err)
 		}
 	}
 	// 自己的地址必须进表：Transport 依赖这张表建立出站连接，
-	// Server 依赖 HTTPPeers 决定是否能把请求代理给别人。
+	// Server 依赖 GRPCPeers 决定是否能把写请求转发给 Leader。
 	if *raftAddrFlag != "" {
 		peersAddrMap[id] = *raftAddrFlag
 	}
-	if *httpAddrFlag != "" {
-		httpAddrMap[id] = *httpAddrFlag
+	if *grpcAddrFlag != "" {
+		grpcAddrMap[id] = *grpcAddrFlag
 	}
 
 	// 配置当前节点参数
-	cfg := config.Default(id, peersAddrMap, httpAddrMap)
+	cfg := config.Default(id, peersAddrMap, grpcAddrMap)
 	cfg.Join = join
 
 	// 启动节点
@@ -145,23 +146,23 @@ func main() {
 
 	// 校验节点 ID：如果 ID 不在集群配置里，ListenAddr 会是空字符串，
 	// 节点会监听在随机端口上，看起来启动成功，实际既无法参与 Raft 通信，
-	// 也无法提供 HTTP 服务。这里直接失败退出，避免出现"假活"节点。
+	// 也无法提供 gRPC 服务。这里直接失败退出，避免出现"假活"节点。
 	// 校验必须放在成员表合并之后：动态加入的节点重启后，自己的地址
 	// 可能只存在于状态机快照里，命令行不一定给出。
 	listenAddr, ok := cfg.Peers[id]
 	if !ok {
 		log.Fatalf("no raft address for node %d: pass -raft-addr and -peers when joining an existing cluster", id)
 	}
-	httpAddr, ok := cfg.HTTPPeers[id]
+	grpcAddr, ok := cfg.GRPCPeers[id]
 	if !ok {
-		log.Fatalf("no HTTP address for node %d: pass -http-addr", id)
+		log.Fatalf("no gRPC address for node %d: pass -grpc-addr", id)
 	}
-	httpPort, err := parseHTTPPort(httpAddr)
+	grpcPort, err := parseGRPCPort(grpcAddr)
 	if err != nil {
-		log.Fatalf("invalid HTTP address for node %d: %v", id, err)
+		log.Fatalf("invalid gRPC address for node %d: %v", id, err)
 	}
 	cfg.ListenAddr = listenAddr
-	cfg.HTTPPort = httpPort
+	cfg.GRPCPort = grpcPort
 
 	// 创建 TCPTransport 实例（同步完成端口监听，失败时直接退出）
 	trans, err := transport.NewTCPTransport(cfg)
@@ -175,13 +176,13 @@ func main() {
 	go srv.Start()
 
 	time.Sleep(2 * time.Second) // 先等待节点集群选出 Leader
-	// 启动 HTTP 服务
-	hServer := httpapi.NewHTTPServer(srv)
+	// 启动 gRPC 服务
+	gServer := grpcapi.NewGRPCServer(srv)
 	go func(port string) {
-		if err := hServer.Start(port); err != nil {
-			log.Fatalf("HTTP server failed: %v", err)
+		if err := gServer.Start(port); err != nil {
+			log.Fatalf("gRPC server failed: %v", err)
 		}
-	}(cfg.HTTPPort)
+	}(cfg.GRPCPort)
 
 	// 优雅退出：收到信号，或者本节点已被移出集群（配置变更日志被应用）
 	sigCh := make(chan os.Signal, 1)
@@ -192,18 +193,19 @@ func main() {
 		log.Printf("[Node %d] 收到退出信号", id)
 	case <-srv.Removed(): // 如果本节点被移出集群，srv.Removed() 返回的 removed channel 会被关闭
 		log.Printf("[Node %d] 已被移出集群，优雅退出", id)
-		// 给 HTTP 层一点时间把“移除成功”的响应写回客户端。
+		// 给 gRPC 层一点时间把“移除成功”的响应写回客户端。
 		// 移除请求可能正是打到本节点（Leader 自删）的，立刻退出会让客户端看到连接被重置。
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	// 停止服务
+	// 先停止对外接口（拒绝新请求、断开 Watch 长连接），再停止 Raft。
+	gServer.Stop()
 	srv.Stop()
 }
 
-// parseHTTPPort 解析 HTTP 地址字符串，返回端口部分。
+// parseGRPCPort 解析 gRPC 地址字符串，返回端口部分。
 // 用 net.SplitHostPort 而不是按 ":" 切分，兼容 IPv6 地址（[::1]:10001）。
-func parseHTTPPort(addr string) (string, error) {
+func parseGRPCPort(addr string) (string, error) {
 	_, port, err := net.SplitHostPort(addr)
 	if err != nil || port == "" {
 		return "", fmt.Errorf("invalid address format: %s", addr)
