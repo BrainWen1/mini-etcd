@@ -1,0 +1,180 @@
+name: CI Pipeline
+
+# 推送到 main、向 main 发起 PR 时触发；也支持在 Actions 页面手动触发
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+# 同一分支/PR 只保留最新一次运行：新的 push 取消上一次未完成的 CI，
+# 既节省 runner 时间，也避免旧提交的镜像最后才推上去把 :latest 覆盖掉
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# 默认最小权限；需要写 packages 的 docker-image job 单独提升
+permissions:
+  contents: read
+
+env:
+  # 与 go.mod 和已提交的 *.pb.go 头部记录的生成器版本保持一致，
+  # 否则 CI 重新生成代码后会产生无意义 diff
+  PROTOC_GEN_GO_VERSION: v1.36.12
+  PROTOC_GEN_GO_GRPC_VERSION: v1.6.2
+  GRPCURL_VERSION: v1.9.4
+
+jobs:
+  # 构建、静态检查、单元测试、端到端测试
+  build-and-test:
+    # 固定 24.04 而不是 ubuntu-latest：apt 里的 protoc 版本（3.21.12）
+    # 与已提交生成物一致，runner 升级到新 LTS 时不会让“生成物是否最新”的检查误报
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+    # 1. 拉取代码
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # 2. 安装并配置 Go 环境
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: 'go.mod' # 自动读取 go.mod 里的版本
+        cache: true               # 缓存 Go 依赖，提升后续构建速度
+
+    # 3. 安装 Protobuf 编译器与代码生成插件（版本固定，避免 @latest 漂移）
+    - name: Install Protoc
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler
+        go install google.golang.org/protobuf/cmd/protoc-gen-go@${{ env.PROTOC_GEN_GO_VERSION }}
+        go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@${{ env.PROTOC_GEN_GO_GRPC_VERSION }}
+        # 写入 GITHUB_PATH 只对后续 step 生效
+        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+    # 4. 重新生成 gRPC 代码，并与仓库中提交的生成物对比。
+    #    生成物是提交进仓库的，这里保证“改了 .proto 但忘了 make proto”能被 CI 拦下来
+    - name: Verify generated gRPC code is up to date
+      run: |
+        make proto
+        git diff --exit-code -- api/proto
+
+    # 5. 格式检查
+    - name: Check formatting
+      run: |
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "以下文件未格式化，请运行 gofmt -w："
+          echo "$unformatted"
+          exit 1
+        fi
+
+    # 6. 静态检查与编译
+    - name: Build & Vet
+      run: |
+        go build ./...
+        go vet ./...
+
+    # 7. 运行并发数据竞争测试
+    - name: Run Tests with Race Detector
+      # -race 开启数据竞争检测，-count=1 确保不走缓存真实跑一遍
+      run: go test -race -count=1 ./...
+
+    # 8. 安装端到端测试依赖（同样固定版本）
+    - name: Install E2E dependencies
+      run: |
+        sudo apt-get install -y jq
+        go install github.com/fullstorydev/grpcurl/cmd/grpcurl@${{ env.GRPCURL_VERSION }}
+        echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+    # 9. 端到端测试：test.sh 自带编译、三节点集群启动、扩缩容/快照恢复与清理
+    - name: E2E - Cluster Lifecycle (test.sh)
+      run: ./test.sh
+
+    # 10. 分布式锁测试：test_lock.sh 假定 127.0.0.1:10001 上已有可用集群，
+    #     所以这里先起一套干净的本地三节点集群，并在 step 结束时回收进程
+    - name: E2E - Distributed Lock (test_lock.sh)
+      run: |
+        rm -rf data test_logs
+        go build -o mini-etcd-e2e ./cmd/mini-etcd
+
+        pids=()
+        for id in 1 2 3; do
+          ./mini-etcd-e2e -id "$id" > "node${id}.log" 2>&1 &
+          pids+=($!)
+        done
+        trap 'kill "${pids[@]}" 2>/dev/null || true' EXIT
+
+        # 不用固定 sleep：轮询 gRPC 反射接口，确认节点真的开始提供服务
+        ready=""
+        for _ in $(seq 1 30); do
+          if grpcurl -plaintext -max-time 1 127.0.0.1:10001 list minietcd.v1.KV > /dev/null 2>&1; then
+            ready=1
+            break
+          fi
+          sleep 1
+        done
+        if [ -z "$ready" ]; then
+          echo "集群在 30 秒内没有就绪，节点日志："
+          cat node1.log node2.log node3.log || true
+          exit 1
+        fi
+
+        ./test_lock.sh
+
+    # 11. E2E 失败时上传节点日志，方便在 Actions 页面直接定位问题
+    - name: Upload E2E logs
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: e2e-logs
+        path: |
+          test_logs
+          node*.log
+        if-no-files-found: ignore
+
+  # 构建 Docker 镜像：PR 只构建（验证 Dockerfile 没写坏），push 到 main 才推送
+  docker-image:
+    needs: build-and-test # 依赖指定的 job 成功完成后才会执行
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # 必须赋予写入 Packages 的权限
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # GHCR 要求镜像名全小写，而 GitHub 用户名（如 BrainWen1）可能含大写字母。
+    # 直接拼 ${{ github.repository }} 会得到非法引用，推送时被拒绝
+    - name: Compute image name
+      run: echo "IMAGE_NAME=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to GitHub Container Registry
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        tags: |
+          ${{ env.IMAGE_NAME }}:latest
+          ${{ env.IMAGE_NAME }}:${{ github.sha }}
+        # 复用上一次构建的层，Docker 构建时间通常能缩短一半以上
+        cache-from: type=gha
+        cache-to: type=gha,mode=max

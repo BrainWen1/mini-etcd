@@ -1,0 +1,20 @@
+# 不要把本地数据、测试产物和仓库元数据打进构建上下文
+.git
+.github
+.vscode
+data
+test_logs
+*.log
+*.db
+*.snap
+mini-etcd
+mini-etcd-test
+mini-etcd-e2e
+node*.log
+
+# 测试脚本与文档不参与镜像构建
+test.sh
+test_lock.sh
+CLAUDE.md
+Dockerfile
+.dockerignore
