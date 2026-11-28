@@ -36,6 +36,7 @@ type Storage interface {
 	CreateSnapshot(index uint64, confState *raftpb.ConfState, data []byte) (raftpb.Snapshot, error)
 	Compact(index uint64) error
 	Close() error
+	Truncate(index uint64) error
 }
 
 // Applier 定义了应用已提交日志条目的接口
