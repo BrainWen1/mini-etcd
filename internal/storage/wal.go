@@ -19,10 +19,29 @@ import (
 	"go.etcd.io/etcd/raft/v3/raftpb"
 )
 
+const (
+	defaultSegmentSize = 64 * 1024 * 1024 // 每个 WAL 分段文件的默认最大大小，64MB
+	walFileExt         = ".wal"           // WAL 文件扩展名
+)
+
 // WALRecord 定义一个 WAL 记录，将 HardState 和 Entries 打包
 type WALRecord struct {
 	HardState raftpb.HardState
 	Entries   []raftpb.Entry
+}
+
+// walMaxIndex 返回一批日志和一条 HardState 中较大的索引。
+// 纯 HardState 记录（commit 推进但本批没有新日志）也覆盖了索引，
+// 计算分段文件的覆盖范围时不能漏掉它，否则 Truncate 可能删掉仍然需要的分段。
+func walMaxIndex(entries []raftpb.Entry, hardState raftpb.HardState) uint64 {
+	var maxIdx uint64
+	if len(entries) > 0 {
+		maxIdx = entries[len(entries)-1].Index
+	}
+	if !raft.IsEmptyHardState(hardState) && hardState.Commit > maxIdx {
+		maxIdx = hardState.Commit
+	}
+	return maxIdx
 }
 
 // firstEntryIndex 返回 WAL 中第一条日志的索引；没有日志时返回 0。
@@ -38,43 +57,103 @@ func firstEntryIndex(entriesList [][]raftpb.Entry) uint64 {
 type WAL struct {
 	*raft.MemoryStorage            // 因为 Raft 算法需要高频调用 Entries() 和 Term()，每次查磁盘会卡死，所以要用内存存储来缓存
 	mu                  sync.Mutex // 保护并发写入
-	file                *os.File   // WAL 文件句柄
-	snapDir             string     // 快照文件目录
+
+	dir         string   // WAL 文件夹路径
+	snapDir     string   // 快照文件目录
+	segmentSize int64    // 单个分段文件的最大字节数
+	activeSize  int64    // 当前活跃文件的大小（字节）
+	activeFile  *os.File // 当前正在写入的文件句柄
+	// 记录每个 WAL 文件对应的最大日志索引，方便 Truncate 时极速判断。
+	// key 一律是文件名（filepath.Base），不能是完整路径。
+	fileMaxIdx map[string]uint64
+	// 最近一次写入非空 HardState 的分段文件名。Truncate 必须保留它：
+	// 快照只持久化 Term/Commit，Vote 只能从 WAL 恢复，删掉会破坏“同一任期只投一票”。
+	lastHardStateFile string
 }
 
 // OpenWAL 打开 WAL 文件，如果文件不存在则创建一个新的文件，并返回一个 WAL 实例
 func OpenWAL(walPath string, snapPath string) (*WAL, error) {
-	// 打开文件流
-	file, err := os.OpenFile(filepath.Join(walPath, "wal.log"), os.O_CREATE|os.O_RDWR, 0644)
+	return OpenWALWithSegmentSize(walPath, snapPath, defaultSegmentSize)
+}
+
+// OpenWALWithSegmentSize 与 OpenWAL 相同，但允许指定单个分段文件的最大字节数。
+// segmentSize <= 0 时回退到默认的 64MB。测试和小内存环境可以调小它。
+func OpenWALWithSegmentSize(walPath string, snapPath string, segmentSize int64) (*WAL, error) {
+	if segmentSize <= 0 {
+		segmentSize = defaultSegmentSize
+	}
+	// 创建 WAL 实例
+	w := &WAL{
+		MemoryStorage: raft.NewMemoryStorage(),
+		dir:           walPath,
+		snapDir:       snapPath,
+		segmentSize:   segmentSize,
+		fileMaxIdx:    make(map[string]uint64),
+	}
+
+	// 读取 WAL 文件夹下的所有文件
+	files, err := os.ReadDir(walPath)
 	if err != nil {
 		return nil, err
 	}
+	var walFiles []string
+	for _, f := range files {
+		if !f.IsDir() && filepath.Ext(f.Name()) == walFileExt {
+			walFiles = append(walFiles, f.Name())
+		}
+	}
+	sort.Strings(walFiles) // 按文件名（如 0000000000000001.wal）字典序排序
 
-	// 创建 WAL 实例
-	w := &WAL{
-		file:          file,
-		MemoryStorage: raft.NewMemoryStorage(),
-		snapDir:       snapPath,
+	var allHardStates []raftpb.HardState
+	var allEntriesList [][]raftpb.Entry
+
+	// 依次读取所有历史 WAL 文件的内容
+	for _, name := range walFiles {
+		// 拼接文件路径，打开文件流
+		path := filepath.Join(walPath, name)
+		file, err := os.OpenFile(path, os.O_RDWR, 0644)
+		if err != nil {
+			return nil, err
+		}
+
+		// 读取文件内容
+		hs, entries, err := w.readFromFile(file)
+		if err != nil {
+			file.Close()
+			return nil, err
+		}
+		// 将读取到的 HardState 和 Entries 追加到总列表中
+		allHardStates = append(allHardStates, hs...)
+		allEntriesList = append(allEntriesList, entries...)
+
+		// 记录该文件最大的日志 Index，方便后续 Truncate。
+		// 注意必须同时考虑 HardState.Commit：只有 HardState 的记录也占用了索引，
+		// 只用 entries 计算会低估文件覆盖范围，导致误删仍有用的分段。
+		var lastEntries []raftpb.Entry
+		if len(entries) > 0 {
+			lastEntries = entries[len(entries)-1]
+		}
+		var lastHS raftpb.HardState
+		if len(hs) > 0 {
+			lastHS = hs[len(hs)-1]
+		}
+		w.fileMaxIdx[name] = walMaxIndex(lastEntries, lastHS)
+		if len(hs) > 0 {
+			// 扫描按文件名顺序进行，这里最终会停在整个 WAL 里最后一条非空 HardState 所在的文件。
+			w.lastHardStateFile = name
+		}
+		file.Close()
 	}
 
 	// 先从独立 .snap 文件加载最新快照
 	snap, err := w.LoadSnapshot()
 	if err != nil {
-		file.Close() // 关闭文件流
 		return nil, err
 	}
 	if snap != nil {
 		if err := w.MemoryStorage.ApplySnapshot(*snap); err != nil {
-			file.Close() // 关闭文件流
 			return nil, fmt.Errorf("failed to apply snapshot to memory storage: %w", err)
 		}
-	}
-
-	// 从文件恢复 HardState 和 Entries
-	hardStates, entriesList, err := w.ReadAll() // ReadAll 会把文件指针移动到最后一条合法记录的末尾，后面就不用再 Seek 了
-	if err != nil {
-		file.Close() // 关闭文件流
-		return nil, err
 	}
 
 	// 日志连续性检查。
@@ -82,33 +161,30 @@ func OpenWAL(walPath string, snapPath string) (*WAL, error) {
 	// （missing log entry [last: X, append at: Y]）。接收过 Leader 快照的节点，
 	// WAL 是从快照之后的索引开始写的，一旦快照文件丢失/损坏，重启时就会出现
 	// “WAL 从 101 开始，但没有快照”的缺口。这里提前返回可操作的错误。
-	if firstWAL := firstEntryIndex(entriesList); firstWAL > 0 {
+	if firstWAL := firstEntryIndex(allEntriesList); firstWAL > 0 {
 		if snap == nil && firstWAL > 1 {
 			// 如果 WAL 里有日志，但没有快照文件，说明快照目录丢失或损坏
-			file.Close()
 			return nil, fmt.Errorf("log starts at index %d but no snapshot file was found; "+
 				"the snapshot directory is missing or corrupted", firstWAL)
 		}
 		if snap != nil && firstWAL > snap.Metadata.Index+1 {
 			// 如果 WAL 里第一条日志的索引大于快照索引 + 1，说明快照文件丢失或损坏
-			file.Close()
 			return nil, fmt.Errorf("log gap: latest snapshot is at index %d, but WAL starts at index %d; "+
 				"the snapshot file is missing or corrupted", snap.Metadata.Index, firstWAL)
 		}
 	}
 
 	// 将读取到的数据恢复到内存存储中
-	for _, entries := range entriesList {
+	for _, entries := range allEntriesList {
 		// 将日志条目追加到内存存储中
 		if err := w.MemoryStorage.Append(entries); err != nil {
-			file.Close() // 关闭文件流
 			return nil, fmt.Errorf("failed to append entries to memory storage: %w", err)
 		}
 	}
 	var hs raftpb.HardState
-	if len(hardStates) > 0 {
+	if len(allHardStates) > 0 {
 		// 如果有 HardState，取最后一条作为最新的 HardState
-		hs = hardStates[len(hardStates)-1]
+		hs = allHardStates[len(allHardStates)-1]
 	} else if snap != nil {
 		// 走到这里说明：磁盘上有快照，但 wal.log 里一条记录都没有（HardState 自然也读不到）。
 		// 真实场景有两种：
@@ -142,7 +218,6 @@ func OpenWAL(walPath string, snapPath string) (*WAL, error) {
 
 	// 将最新的 HardState 设置到内存存储中
 	if err := w.MemoryStorage.SetHardState(hs); err != nil {
-		file.Close() // 关闭文件流
 		return nil, fmt.Errorf("failed to set hard state in memory storage: %w", err)
 	}
 
@@ -151,8 +226,8 @@ func OpenWAL(walPath string, snapPath string) (*WAL, error) {
 	// 快照索引 > LastIndex 恒不成立，这个校验永远不会触发。这里改用 WAL 文件里真实的最后一条日志索引。
 	if snap != nil {
 		var walLastIndex uint64
-		if n := len(entriesList); n > 0 {
-			if last := entriesList[n-1]; len(last) > 0 {
+		if n := len(allEntriesList); n > 0 {
+			if last := allEntriesList[n-1]; len(last) > 0 {
 				walLastIndex = last[len(last)-1].Index // WAL 最后一条日志的索引
 			}
 		}
@@ -163,7 +238,65 @@ func OpenWAL(walPath string, snapPath string) (*WAL, error) {
 		}
 	}
 
+	// 确定当前的 activeFile 和 activeSize
+	if len(walFiles) == 0 {
+		// 全新的节点，创建 1 号分段（文件序号，不是日志索引）
+		if err := w.createNewSegment(1); err != nil {
+			return nil, err
+		}
+	} else {
+		// 打开最后一个文件用于追加写入
+		lastFile := walFiles[len(walFiles)-1]
+		path := filepath.Join(walPath, lastFile)
+		file, err := os.OpenFile(path, os.O_RDWR|os.O_APPEND, 0644)
+		if err != nil {
+			return nil, err
+		}
+		info, err := file.Stat()
+		if err != nil {
+			file.Close()
+			return nil, err
+		}
+		w.activeFile = file
+		w.activeSize = info.Size()
+	}
+
 	return w, nil
+}
+
+// createNewSegment 创建一个新的 WAL 分段文件。
+// 文件按创建顺序编号（1、2、3...），统一格式化成 16 位十六进制，
+// 这样按文件名字典序排序就是写入顺序，且不会因为十进制超过 9 而错位。
+func (w *WAL) createNewSegment(seq uint64) error {
+	filename := fmt.Sprintf("%016x%s", seq, walFileExt)
+	path := filepath.Join(w.dir, filename)
+	// 打开文件用于写入，如果文件不存在则创建
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	// 新建文件后必须 fsync 目录：否则崩溃后目录项可能丢失，已经 fsync 过文件内容的
+	// 记录会连同文件名一起消失，破坏 WAL 的持久化保证。
+	if err := syncDir(w.dir); err != nil {
+		file.Close()
+		return err
+	}
+
+	// 更新当前活跃文件句柄和大小，并记录该文件的最大索引为 0（新文件还没有写入任何日志）
+	w.activeFile = file
+	w.activeSize = 0
+	w.fileMaxIdx[filename] = 0
+	return nil
+}
+
+// syncDir 对目录执行 fsync，确保新建/删除的文件目录项落盘。
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // Close 关闭 WAL 文件
@@ -172,7 +305,7 @@ func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	return w.file.Close()
+	return w.activeFile.Close()
 }
 
 // Save 将整个 Ready 打包成一条记录追加写入文件
@@ -201,20 +334,31 @@ func (w *WAL) Save(hardState raftpb.HardState, entries []raftpb.Entry) error {
 		return fmt.Errorf("gob encode failed: %w", err)
 	}
 	data := buf.Bytes()
-	// 2. 写入 4 字节的长度头 (大端序)
+	// 2. 检查当前活跃文件大小，如果超过阈值就切换到新文件。
+	// activeSize == 0 时不轮转：单条记录本身就超过阈值时，换文件也没有意义，
+	// 只会白白留下一个空分段。
+	frameSize := int64(4 + len(data))
+	if w.activeSize > 0 && w.activeSize+frameSize > w.segmentSize {
+		if err := w.rotate(); err != nil {
+			return fmt.Errorf("rotate WAL failed: %w", err)
+		}
+	}
+	// 3. 写入 4 字节的长度头 (大端序)
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(data)))
-	if _, err := w.file.Write(hdr[:]); err != nil {
+	if _, err := w.activeFile.Write(hdr[:]); err != nil {
 		return err
 	}
-	// 3. 写入实际数据
-	if _, err := w.file.Write(data); err != nil {
+	// 4. 写入实际数据
+	if _, err := w.activeFile.Write(data); err != nil {
 		return err
 	}
-	// 4. 强制刷盘
-	if err := w.file.Sync(); err != nil {
+	// 5. 强制刷盘
+	if err := w.activeFile.Sync(); err != nil {
 		return fmt.Errorf("failed to sync WAL file: %w", err)
 	}
+
+	w.activeSize += frameSize
 
 	// 更新内存
 	if !raft.IsEmptyHardState(hardState) {
@@ -228,16 +372,46 @@ func (w *WAL) Save(hardState raftpb.HardState, entries []raftpb.Entry) error {
 		}
 	}
 
+	// 更新当前活跃文件的最大索引。
+	// key 必须用文件名（与 OpenWAL 扫描时一致），不能用 activeFile.Name() 返回的完整路径，
+	// 否则 Truncate 会拿着一堆对不上的 key，既漏删旧文件、又可能拼出错误的删除路径。
+	// 取 max 而不是直接覆盖：日志冲突覆盖时新写入的条目索引可能比文件里已有的更小，
+	// 分段覆盖范围只能单调不减。
+	name := filepath.Base(w.activeFile.Name())
+	if idx := walMaxIndex(entries, hardState); idx > w.fileMaxIdx[name] {
+		w.fileMaxIdx[name] = idx
+	}
+	if !raft.IsEmptyHardState(hardState) {
+		w.lastHardStateFile = name
+	}
+
 	return nil
 }
 
-// ReadAll 重启时，按顺序读取出所有的记录
-func (w *WAL) ReadAll() ([]raftpb.HardState, [][]raftpb.Entry, error) {
+// rotate 关闭当前活跃文件，并创建一个新的 WAL 分段文件
+func (w *WAL) rotate() error {
+	// 文件名是 16 位十六进制序号，解析时必须用 base 16。
+	// 用 base 10 解析会在序号 10（a）之后失败，随后重新创建 1 号文件，
+	// 造成文件覆盖和重启时的日志乱序/丢失。
+	fileName := filepath.Base(w.activeFile.Name())
+	if err := w.activeFile.Close(); err != nil {
+		return err
+	}
+	seq, err := strconv.ParseUint(strings.TrimSuffix(fileName, walFileExt), 16, 64)
+	if err != nil {
+		return fmt.Errorf("parse WAL segment name %q: %w", fileName, err)
+	}
+
+	return w.createNewSegment(seq + 1)
+}
+
+// readFromFile 从指定的 WAL 文件中读取所有记录，并返回 HardState 和 Entries 列表
+func (w *WAL) readFromFile(file *os.File) ([]raftpb.HardState, [][]raftpb.Entry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	// 将文件指针归位到开头，准备读取
-	if _, err := w.file.Seek(0, 0); err != nil {
+	if _, err := file.Seek(0, 0); err != nil {
 		return nil, nil, err
 	}
 
@@ -248,7 +422,7 @@ func (w *WAL) ReadAll() ([]raftpb.HardState, [][]raftpb.Entry, error) {
 	for {
 		// 1. 读取 4 字节长度头
 		var hdr [4]byte
-		if _, err := io.ReadFull(w.file, hdr[:]); err != nil {
+		if _, err := io.ReadFull(file, hdr[:]); err != nil {
 			if errors.Is(err, io.EOF) {
 				break // 正常读完
 			}
@@ -265,7 +439,7 @@ func (w *WAL) ReadAll() ([]raftpb.HardState, [][]raftpb.Entry, error) {
 
 		// 2. 根据长度读取数据体
 		payload := make([]byte, length)
-		if _, err := io.ReadFull(w.file, payload); err != nil {
+		if _, err := io.ReadFull(file, payload); err != nil {
 			log.Printf("Warning: incomplete payload read: %v. Truncating.", err)
 			break // 数据体没读满，说明写一半断电了
 		}
@@ -290,7 +464,7 @@ func (w *WAL) ReadAll() ([]raftpb.HardState, [][]raftpb.Entry, error) {
 	}
 
 	// 4. 如果发现文件有坏尾巴（比如崩溃了），截断它
-	fileInfo, err := w.file.Stat()
+	fileInfo, err := file.Stat()
 	if err != nil {
 		// 如果连文件信息都获取不到，说明文件可能被删除了，直接返回错误
 		log.Printf("Warning: failed to stat WAL file: %v. Returning error.", err)
@@ -298,17 +472,70 @@ func (w *WAL) ReadAll() ([]raftpb.HardState, [][]raftpb.Entry, error) {
 	}
 	if fileInfo.Size() > lastValidOffset {
 		log.Printf("WAL file corrupted or incomplete. Truncating from %d to %d bytes.", fileInfo.Size(), lastValidOffset)
-		if err := w.file.Truncate(lastValidOffset); err != nil {
+		if err := file.Truncate(lastValidOffset); err != nil {
 			return nil, nil, fmt.Errorf("failed to truncate WAL: %w", err)
 		}
 	}
 
 	// 5. 指针回到最后一条合法记录的末尾，准备追加写入
-	if _, err := w.file.Seek(lastValidOffset, io.SeekStart); err != nil {
+	if _, err := file.Seek(lastValidOffset, io.SeekStart); err != nil {
 		return nil, nil, err
 	}
 
 	return hardStates, entriesList, nil
+}
+
+// Truncate 删除所有最大索引小于 snapshotIndex 的 WAL 分段文件。
+//
+// 安全约束：
+//  1. 正在写入的活跃分段永远保留；
+//  2. 最近一次写入非空 HardState 的分段永远保留 —— 快照只记录 Term/Commit，
+//     Vote 只能从 WAL 恢复，删掉它可能导致同一任期重复投票；
+//  3. 只有整个分段的日志都被快照覆盖（maxIdx < snapshotIndex）才删除，
+//     恰好等于快照索引的分段也保留，避免索引越界。
+//
+// 删除单个文件失败不会中断其余文件的清理，函数返回第一个错误。
+func (w *WAL) Truncate(snapshotIndex uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// 获取当前活跃文件的文件名，避免误删
+	activeName := filepath.Base(w.activeFile.Name())
+
+	// 按文件名排序，保证删除顺序稳定、日志可读
+	names := make([]string, 0, len(w.fileMaxIdx))
+	for name := range w.fileMaxIdx {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var firstErr error
+	for _, name := range names {
+		if name == activeName {
+			continue // 绝对不能删正在写的文件
+		}
+		if name == w.lastHardStateFile {
+			continue // 最新 HardState 还要用来恢复 Term/Vote
+		}
+		maxIdx := w.fileMaxIdx[name]
+		if maxIdx == 0 || maxIdx >= snapshotIndex {
+			// maxIdx == 0：空分段或纯空 HardState，没有可直接判断的覆盖范围，保守保留
+			continue
+		}
+		// 整个分段的日志都小于快照索引，说明已被快照完全覆盖，可以删除
+		path := filepath.Join(w.dir, name)
+		log.Printf("Truncating WAL segment %s (max index: %d < snapshot index: %d)", name, maxIdx, snapshotIndex)
+		if err := os.Remove(path); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			log.Printf("Warning: failed to remove WAL segment %s: %v", name, err)
+			continue
+		}
+		// 从 fileMaxIdx 中删除该文件的记录
+		delete(w.fileMaxIdx, name)
+	}
+	return firstErr
 }
 
 // SaveSnapshot 将快照保存到独立的 .snap 文件中

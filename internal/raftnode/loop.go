@@ -15,7 +15,20 @@ import (
 const (
 	// 触发快照的阈值：距离上一次快照超过 snapshotThreshold 条日志就触发快照
 	snapshotThreshold = 10
+	// MemoryStorage 压缩时保留的最近日志条数：不要全删，防止 Raft 追赶日志时越界
+	compactRetainCount = 100
 )
+
+// truncateWALAfterSnapshot 删除完全被快照覆盖的 WAL 分段。
+// 删不掉不影响核心功能（下次快照或重启后还会再试），所以只记 Warning。
+func (rn *RaftNode) truncateWALAfterSnapshot(snapshotIndex uint64) {
+	if err := rn.storage.Truncate(snapshotIndex); err != nil {
+		log.Printf("[Node %d] Warning: failed to truncate WAL segments covered by snapshot index %d: %v",
+			rn.nodeID, snapshotIndex, err)
+		return
+	}
+	log.Printf("[Node %d] Truncated WAL segments fully covered by snapshot index %d", rn.nodeID, snapshotIndex)
+}
 
 // Run 启动核心循环
 func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { // stopc 为只读 channel，接收停止信号
@@ -68,6 +81,9 @@ func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { /
 					log.Fatalf("save snapshot failed: %v", err)
 				}
 				// 让 MemoryStorage 应用快照，更新内存状态
+				// 实际上这里调用的是 MemoryStorage.ApplySnapshot()，它会自动丢弃内存中
+				// 所有小于快照索引的日志，避免内存泄漏。注意：这里的快照是 Raft 的快照，而不是状态机的快照。
+				// 所以这里不需要再调用 storage.Compact() 来清理内存日志，随意调用的话可能会因为索引越界而出现问题。
 				if err := rn.storage.ApplySnapshot(rd.Snapshot); err != nil {
 					log.Fatalf("apply snapshot failed: %v", err)
 				}
@@ -89,6 +105,10 @@ func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { /
 				// 否则落后节点收到快照后 appliedIndex 还停在旧值，而后续不会再有
 				// 快照之前的 CommittedEntries，ReadIndex 就永远判定为“未追平”。
 				rn.appliedIndex = max(rn.appliedIndex, rd.Snapshot.Metadata.Index)
+
+				// WAL 清理：快照索引之前的日志已经被状态机吸收，没必要再保留。
+				// WAL 会删除所有最大索引小于快照索引的分段；活跃分段和最新 HardState 所在分段始终保留。
+				rn.truncateWALAfterSnapshot(rd.Snapshot.Metadata.Index)
 			}
 
 			// 2. 持久化
@@ -243,16 +263,20 @@ func (rn *RaftNode) Run(stopc <-chan struct{}, tickerInterval time.Duration) { /
 								rn.lastSnapshotIndex = lastAppliedIndex
 
 								// d. 通知 MemoryStorage 清理旧的日志，防止内存泄漏
-								// 为了安全，保留最近 100 条，不要全删，防止 Raft 追赶日志时越界
 								compactIndex := uint64(1) // 默认从 1 开始压缩，防止下溢
-								if lastAppliedIndex > 100 {
-									compactIndex = lastAppliedIndex - 100
+								if lastAppliedIndex > compactRetainCount {
+									compactIndex = lastAppliedIndex - compactRetainCount
 								}
 
 								// 忽略已经压缩过的错误
 								if err := rn.storage.Compact(compactIndex); err != nil && !errors.Is(err, raft.ErrCompacted) {
 									log.Printf("failed to compact logs: %v", err)
 								}
+
+								// e. 通知 WAL 清理旧的日志文件，防止磁盘占满
+								// 这里的 rn.lastSnapshotIndex 就是刚落盘的快照索引：所有最大索引
+								// 小于它的分段都已被状态机的快照吸收。活跃分段和最新 HardState 所在分段始终保留。
+								rn.truncateWALAfterSnapshot(rn.lastSnapshotIndex)
 							}
 						}
 					}
